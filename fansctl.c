@@ -1,9 +1,11 @@
 /*
- * fansctl - macOS SMC 风扇/温度 CLI (Apple Silicon 兼容)
- * SMC 读取核心在 fansctl.h (与菜单栏程序 fansbar 共享)
+ * fansctl - macOS SMC 风扇/温度工具 (Apple Silicon 兼容)
+ * 一个程序两种形态: 无参数 = 菜单栏应用(fork 后台); 带参数 = CLI
+ * SMC 读取核心在 fansctl.h, 菜单栏界面在 fansbar.m
  *
  * 用法:
- *   fansctl               列出风扇转速(只读)
+ *   fansctl               启动菜单栏应用(自动进后台, 不占用终端)
+ *   fansctl fans          列出风扇转速(只读)
  *   fansctl status        当前/目标转速与模式
  *   fansctl temps         列出所有温度传感器
  *   fansctl dump          导出全部 SMC 键值(探索用)
@@ -11,7 +13,8 @@
  *   sudo fansctl set <rpm> [N]   设定转速(不带 N = 全部风扇)
  *   sudo fansctl max [N]         全速(不带 N = 全部风扇)
  *   sudo fansctl auto [N]        恢复自动(不带 N = 全部风扇)
- *   sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 退出恢复)
+ *   sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart stop 退出恢复)
+ *   sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
  */
 #include "fansctl.h"
 
@@ -378,9 +381,45 @@ static void watch_loop(int interval) {
     }
 }
 
+/* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
+
+/* fansctl __apply max|auto|set <rpm>  — 静默作用于全部风扇, 给菜单栏用 */
+static int apply_cmd(int argc, char **argv) {
+    if (argc < 3) return 1;
+    const char *act = argv[2];
+    int n = fan_count();
+    if (n < 1) n = 1;
+    int rc = 0;
+    if (strcmp(act, "max") == 0) {
+        for (int i = 0; i < n; i++) if (fan_max(i) != 0) rc = 1;
+    } else if (strcmp(act, "auto") == 0) {
+        for (int i = 0; i < n; i++) if (fan_auto(i) != 0) rc = 1;
+    } else if (strcmp(act, "set") == 0 && argc > 3) {
+        double rpm = atof(argv[3]);
+        for (int i = 0; i < n; i++) if (fan_set(i, rpm) != 0) rc = 1;
+    } else {
+        rc = 1;
+    }
+    return rc;
+}
+
+/* fansctl __smart 低 高 — root 后台运行的智能模式 (菜单栏启动), pidfile 标记状态 */
+static int smart_hidden_cmd(int argc, char **argv) {
+    double t_lo = argc > 2 ? atof(argv[2]) : 40;
+    double t_hi = argc > 3 ? atof(argv[3]) : 80;
+    if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) return 1;
+    int pid; double a, b;
+    if (smart_pid_read(&pid, &a, &b)) return 1; /* 已有实例在跑 */
+    if (smc_open() != 0) return 1;
+    smart_pid_write(t_lo, t_hi);
+    int rc = smart_loop(t_lo, t_hi);
+    smart_pid_clear();
+    smc_close();
+    return rc;
+}
+
 int main(int argc, char **argv) {
-    const char *cmd = argc > 1 ? argv[1] : "fans";
-    g_debug = getenv("FANSCTL_DEBUG") != NULL;
+    const char *cmd = argc > 1 ? argv[1] : NULL;
     /* osascript 提权链会把 SIGINT/SIGTERM/SIGHUP 阻塞并跨 exec 继承,
        导致 smart 的优雅退出和 Ctrl+C 全部失效, 在此解除 */
     {
@@ -391,10 +430,14 @@ int main(int argc, char **argv) {
         sigaddset(&un, SIGHUP);
         sigprocmask(SIG_UNBLOCK, &un, NULL);
     }
+    if (!cmd) return bar_main(); /* 菜单栏应用, bar_main 自行打开 SMC */
+    if (strcmp(cmd, "__apply") == 0) return apply_cmd(argc, argv);
+    if (strcmp(cmd, "__smart") == 0) return smart_hidden_cmd(argc, argv);
+    g_debug = getenv("FANSCTL_DEBUG") != NULL;
     if (smc_open() != 0) return 1;
     int rc = 0;
 
-    if (strcmp(cmd, "fans") == 0 || strcmp(cmd, "") == 0) {
+    if (strcmp(cmd, "fans") == 0) {
         print_fans();
     } else if (strcmp(cmd, "status") == 0) {
         print_status();
@@ -456,22 +499,41 @@ int main(int argc, char **argv) {
         }
     } else if (strcmp(cmd, "smart") == 0) {
         if (geteuid() != 0) {
-            fprintf(stderr, "需要 root 权限:  sudo fansctl smart [低温°C] [高温°C]\n");
+            fprintf(stderr, "需要 root 权限:  sudo fansctl smart [低温°C] [高温°C] | stop\n");
             rc = 1;
+        } else if (argc > 2 && strcmp(argv[2], "stop") == 0) {
+            int pid; double lo, hi;
+            if (!smart_pid_read(&pid, &lo, &hi)) {
+                fprintf(stderr, "智能模式未在运行\n");
+                rc = 1;
+            } else if (kill(pid, SIGTERM) != 0) {
+                perror("kill");
+                rc = 1;
+            } else {
+                printf("已通知智能模式退出(将恢复自动)\n");
+            }
         } else {
             double t_lo = argc > 2 ? atof(argv[2]) : 40;
             double t_hi = argc > 3 ? atof(argv[3]) : 80;
+            int pid; double a, b;
             if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) {
                 fprintf(stderr, "阈值无效: 需 20 < 低温 且 高温 >= 低温+5 且 高温 <= 120\n");
                 rc = 1;
+            } else if (smart_pid_read(&pid, &a, &b)) {
+                fprintf(stderr, "智能模式已在运行 (pid %d, %.0f~%.0f°C), 先 sudo fansctl smart stop\n",
+                        pid, a, b);
+                rc = 1;
             } else {
+                smart_pid_write(t_lo, t_hi);
                 rc = smart_loop(t_lo, t_hi);
+                smart_pid_clear();
             }
         }
     } else {
         fprintf(stderr,
-            "用法: fansctl [fans|status|temps|dump|watch|set|max|auto]\n"
-            "  fans            风扇转速(默认, 只读)\n"
+            "用法: fansctl            启动菜单栏应用(fork 后台, 不占终端)\n"
+            "      fansctl <子命令>   命令行模式\n"
+            "  fans            风扇转速(只读)\n"
             "  status          风扇当前/目标转速与模式\n"
             "  temps           所有温度传感器\n"
             "  dump            导出全部 SMC 键\n"
@@ -479,7 +541,8 @@ int main(int argc, char **argv) {
             "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
             "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
             "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
-            "  smart [低 高]   智能曲线, 默认 40~80°C, Ctrl+C 退出恢复 (需 sudo)\n");
+            "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
+            "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n");
         smc_close();
         return 1;
     }

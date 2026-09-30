@@ -3,6 +3,7 @@
 #define FANSCTL_H
 
 #include <IOKit/IOKitLib.h>
+#include <errno.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -195,5 +196,36 @@ static inline double hottest_temp(const char **name_out) {
     if (name_out) *name_out = mxk;
     return mx;
 }
+
+/* ============ 智能模式运行状态 (pidfile, CLI 与菜单栏互通) ============ */
+
+#define SMART_PIDFILE "/tmp/fansctl.smart.pid"
+
+/* 内容: "<pid> <低阈值> <高阈值>"。进程已死则顺手清掉残留文件 */
+static inline int smart_pid_read(int *pid_out, double *lo_out, double *hi_out) {
+    FILE *f = fopen(SMART_PIDFILE, "r");
+    if (!f) return 0;
+    int pid = 0; double lo = 0, hi = 0;
+    int ok = fscanf(f, "%d %lf %lf", &pid, &lo, &hi) == 3;
+    fclose(f);
+    if (!ok) { unlink(SMART_PIDFILE); return 0; }
+    if (kill(pid, 0) != 0 && errno == ESRCH) { unlink(SMART_PIDFILE); return 0; }
+    if (pid_out) *pid_out = pid;
+    if (lo_out) *lo_out = lo;
+    if (hi_out) *hi_out = hi;
+    return 1;
+}
+
+static inline void smart_pid_write(double lo, double hi) {
+    FILE *f = fopen(SMART_PIDFILE, "w");
+    if (!f) return;
+    fprintf(f, "%d %.0f %.0f\n", (int)getpid(), lo, hi);
+    fclose(f);
+}
+
+static inline void smart_pid_clear(void) { unlink(SMART_PIDFILE); }
+
+/* 菜单栏界面 (fansbar.m): 无参数启动时进入 */
+int bar_main(void);
 
 #endif /* FANSCTL_H */
