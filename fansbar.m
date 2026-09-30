@@ -41,10 +41,14 @@ static NSString *sh_quote(NSString *s) {
 
 /* 弹管理员授权框以 root 执行 shell 命令; 失败返回 NO。
    经 NSTask 调 /usr/bin/osascript (命令行 osascript 从无 Info.plist 的
-   后台进程弹授权窗已验证可用; 而进程内 NSAppleScript 会静默失败)。 */
+   后台进程弹授权窗已验证可用; 而进程内 NSAppleScript 会静默失败)。
+   注意: AppleScript 字符串只认双引号, 不能直接用 sh_quote 的单引号结果。 */
 static BOOL run_root(NSString *shell) {
+    NSString *escaped = [[sh_quote(shell)
+        stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+        stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
     NSString *script = [NSString stringWithFormat:
-        @"do shell script %@ with administrator privileges", sh_quote(shell)];
+        @"do shell script \"%@\" with administrator privileges", escaped];
     NSTask *t = [[NSTask alloc] init];
     t.launchPath = @"/usr/bin/osascript";
     t.arguments = @[@"-e", script];
