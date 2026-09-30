@@ -1,19 +1,25 @@
 CC = /usr/bin/clang
 CFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation
+BARFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation -framework AppKit
 PREFIX = $(HOME)/.local/bin
 
-fansctl: fansctl.c
-	$(CC) $(CFLAGS) -o $@ $<
+all: fansctl fansbar
+
+fansctl: fansctl.c fansctl.h
+	$(CC) $(CFLAGS) -o $@ fansctl.c
+
+fansbar: fansbar.m fansctl.h
+	$(CC) $(BARFLAGS) -o $@ fansbar.m
 
 # 注意: 不能 cp 原地覆盖旧二进制 — AMFI 对 inode 缓存签名, 覆盖后 exec 会被 SIGKILL
-install: fansctl
-	rm -f $(PREFIX)/fansctl
-	cp fansctl $(PREFIX)/fansctl
+install: all
+	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
+	cp fansctl fansbar $(PREFIX)/
 
 uninstall:
-	rm -f $(PREFIX)/fansctl
+	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
 
 clean:
-	rm -f fansctl
+	rm -f fansctl fansbar
 
-.PHONY: clean install uninstall
+.PHONY: all clean install uninstall

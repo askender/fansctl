@@ -1,5 +1,6 @@
 /*
  * fansctl - macOS SMC 风扇/温度 CLI (Apple Silicon 兼容)
+ * SMC 读取核心在 fansctl.h (与菜单栏程序 fansbar 共享)
  *
  * 用法:
  *   fansctl               列出风扇转速(只读)
@@ -12,117 +13,7 @@
  *   sudo fansctl auto [N]        恢复自动(不带 N = 全部风扇)
  *   sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 退出恢复)
  */
-#include <IOKit/IOKitLib.h>
-#include <math.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#define KERNEL_INDEX_SMC     2
-#define SMC_CMD_READ_BYTES   5
-#define SMC_CMD_WRITE_BYTES  6
-#define SMC_CMD_READ_INDEX   8
-#define SMC_CMD_READ_KEYINFO 9
-
-typedef struct { UInt8 major, minor, build, reserved; UInt16 release; } SMCVersion;
-typedef struct { UInt16 version, length; UInt32 cpuPLimit, gpuPLimit, memPLimit; } SMCPLimitData;
-typedef struct { UInt32 dataSize; UInt32 dataType; UInt8 attr; } SMCKeyInfoData;
-typedef UInt8 SMCBytes[32];
-
-/* macOS 12+ (Apple Silicon) 布局: 总长 80 字节 */
-typedef struct {
-    UInt32 key;               /* 0 */
-    SMCVersion vers;          /* 4..10 */
-    SMCPLimitData pLimitData; /* 12..28 */
-    SMCKeyInfoData keyInfo;   /* 28..40 */
-    UInt8  result;            /* 40 */
-    UInt8  status;            /* 41 */
-    UInt8  data8;             /* 42 */
-    UInt32 data32;            /* 44 */
-    SMCBytes bytes;           /* 48..80 */
-} SMCKeyData;
-
-_Static_assert(sizeof(SMCKeyData) == 80, "SMCKeyData 必须是 80 字节");
-
-static io_connect_t g_conn = 0;
-
-static void key_to_str(UInt32 key, char out[5]) {
-    out[0] = (key >> 24) & 0xff; out[1] = (key >> 16) & 0xff;
-    out[2] = (key >> 8) & 0xff;  out[3] = key & 0xff; out[4] = 0;
-}
-
-static UInt32 str_to_key(const char *s) {
-    return ((UInt32)(UInt8)s[0] << 24) | ((UInt32)(UInt8)s[1] << 16) |
-           ((UInt32)(UInt8)s[2] << 8)  |  (UInt32)(UInt8)s[3];
-}
-
-static int smc_open(void) {
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
-    if (!svc) { fprintf(stderr, "未找到 AppleSMC 服务\n"); return -1; }
-    kern_return_t r = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-    IOObjectRelease(svc);
-    if (r != KERN_SUCCESS) { fprintf(stderr, "IOServiceOpen 失败: 0x%x (试试 sudo)\n", r); return -1; }
-    return 0;
-}
-
-static void smc_close(void) { if (g_conn) IOServiceClose(g_conn); }
-
-static kern_return_t smc_call(SMCKeyData *in, SMCKeyData *out) {
-    size_t sz = sizeof(SMCKeyData);
-    return IOConnectCallStructMethod(g_conn, KERNEL_INDEX_SMC, in, sizeof(SMCKeyData), out, &sz);
-}
-
-static int g_debug;
-static kern_return_t smc_read_key(const char *keyname, UInt8 *buf, size_t *len) {
-    SMCKeyData in = {0}, out = {0};
-    in.key = str_to_key(keyname);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    kern_return_t r = smc_call(&in, &out);
-    if (g_debug) fprintf(stderr, "[dbg] %s keyinfo: kr=0x%x result=%u size=%u type=%#x\n", keyname, r, out.result, out.keyInfo.dataSize, out.keyInfo.dataType);
-    if (r != KERN_SUCCESS) return r;
-    if (out.result != 0) return kIOReturnNotFound;
-    *len = out.keyInfo.dataSize;
-    in.keyInfo.dataSize = out.keyInfo.dataSize;
-    in.keyInfo.dataType = out.keyInfo.dataType;
-    in.data8 = SMC_CMD_READ_BYTES;
-    r = smc_call(&in, &out);
-    if (r != KERN_SUCCESS) return r;
-    memcpy(buf, out.bytes, *len);
-    return KERN_SUCCESS;
-}
-
-static void type_str(UInt32 t, char out[5]) {    out[0] = (t >> 24) & 0xff; out[1] = (t >> 16) & 0xff;
-    out[2] = (t >> 8) & 0xff;  out[3] = t & 0xff; out[4] = 0;
-}
-
-/* 返回: 0=成功解码并填入 value; 1=类型不支持(打印原始 hex); -1=读取失败 */
-static int read_key_value(const char *keyname, UInt32 *type_out, double *value, char rawhex[80]) {
-    UInt8 buf[32]; size_t len = sizeof(buf);
-    kern_return_t r = smc_read_key(keyname, buf, &len);
-    if (r != KERN_SUCCESS) {
-        if (r == kIOReturnNotFound) return -1;
-        return -1;
-    }
-    SMCKeyData in = {0}, out = {0};
-    in.key = str_to_key(keyname);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    smc_call(&in, &out);
-    UInt32 type = out.keyInfo.dataType;
-    if (type_out) *type_out = type;
-    char t[5]; type_str(type, t);
-    rawhex[0] = 0;
-    for (size_t i = 0; i < len; i++) snprintf(rawhex + strlen(rawhex), 8, "%02x ", buf[i]);
-
-    if (strcmp(t, "fpe2") == 0 && len >= 2) { *value = (double)((buf[0] << 8) | buf[1]) / 4.0; return 0; }
-    if (strcmp(t, "ui8 ") == 0 && len >= 1) { *value = buf[0]; return 0; }
-    if (strcmp(t, "ui16") == 0 && len >= 2) { *value = (buf[0] << 8) | buf[1]; return 0; }
-    if (strcmp(t, "ui32") == 0 && len >= 4) { *value = ((UInt32)buf[0]<<24)|((UInt32)buf[1]<<16)|((UInt32)buf[2]<<8)|buf[3]; return 0; }
-    if (strcmp(t, "sp78") == 0 && len >= 2) { *value = (double)(int16_t)((buf[0] << 8) | buf[1]) / 256.0; return 0; }
-    if (strcmp(t, "flt ") == 0 && len >= 4) { float f; memcpy(&f, buf, 4); *value = f; return 0; }
-    return 1;
-}
+#include "fansctl.h"
 
 /* ==================== 写入/控制 (需要 root) ==================== */
 
@@ -160,20 +51,6 @@ static int key_exists(const char *k) {
     in.data8 = SMC_CMD_READ_KEYINFO;
     kern_return_t r = smc_call(&in, &out);
     return r == KERN_SUCCESS && out.result == 0;
-}
-
-static int fan_count(void) {
-    double v = 0; UInt32 t; char hex[80];
-    if (read_key_value("FNum", &t, &v, hex) == 0 && v > 0 && v < 10) return (int)v;
-    return 0;
-}
-
-static int read_rpm_key(int idx, const char *suffix, double *out) {
-    char k[5];
-    snprintf(k, sizeof(k), "F%d%s", idx, suffix);
-    UInt32 t; char hex[80];
-    if (read_key_value(k, &t, out, hex) == 0 && *out >= 0) return 0;
-    return -1;
 }
 
 /* F?md / F?Md 探测; 找到返回1并填键名, 否则返回0 (用 FS! 位掩码) */
@@ -339,27 +216,6 @@ static void print_status(void) {
     }
 }
 
-static UInt32 total_keys(void) {
-    double v; char hex[80]; UInt32 t;
-    if (read_key_value("#KEY", &t, &v, hex) == 0 && v > 0 && v < 100000) return (UInt32)v;
-    UInt8 buf[32]; size_t len = sizeof(buf);
-    if (smc_read_key("#KEY", buf, &len) == KERN_SUCCESS && len >= 4) {
-        UInt32 le = buf[0] | buf[1]<<8 | buf[2]<<16 | (UInt32)buf[3]<<24;
-        if (le > 0 && le < 100000) return le;
-    }
-    return 0;
-}
-
-static int get_key_at(UInt32 idx, char keyname[5]) {
-    SMCKeyData in = {0}, out = {0};
-    in.data8 = SMC_CMD_READ_INDEX;
-    in.data32 = idx;
-    kern_return_t r = smc_call(&in, &out);
-    if (r != KERN_SUCCESS) return -1;
-    key_to_str(out.key, keyname);
-    return 0;
-}
-
 static void print_fans(void) {
     int n = 0;
     for (char c = '0'; c <= '9'; c++) {
@@ -388,8 +244,6 @@ static void print_fans(void) {
     }
     if (!n) printf("未发现风扇键(F*Ac)\n");
 }
-
-static int plausible_temp(double v) { return v > -5 && v < 130; }
 
 static void print_temps(void) {
     UInt32 n = total_keys();
@@ -425,47 +279,6 @@ static void print_dump(void) {
         if (rc == 0)      printf("%-6s %-4s %12.3f\n", k, ts, v);
         else if (rc == 1) printf("%-6s %-4s   raw: %s\n", k, ts, hex);
     }
-}
-
-/* watch 用的温度键缓存: 首次枚举全部键, 之后只重读这些 */
-static char (*g_tkeys)[5];
-static int g_tkey_n;
-
-static void scan_temp_keys(void) {
-    if (g_tkey_n) return;
-    UInt32 n = total_keys();
-    if (!n) return;
-    char (*list)[5] = malloc(n * sizeof(*list));
-    if (!list) return;
-    int cnt = 0;
-    for (UInt32 i = 0; i < n; i++) {
-        char k[5];
-        if (get_key_at(i, k) != 0) continue;
-        if (k[0] != 'T') continue;
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(k, &t, &v, hex) == 0 && plausible_temp(v)) {
-            memcpy(list[cnt], k, 5);
-            cnt++;
-        }
-    }
-    g_tkeys = list;
-    g_tkey_n = cnt;
-}
-
-/* 全部温度键里的最高读数; name_out 可为 NULL。无数据返回 -1000 */
-static double hottest_temp(const char **name_out) {
-    scan_temp_keys();
-    double mx = -999;
-    const char *mxk = NULL;
-    for (int i = 0; i < g_tkey_n; i++) {
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(g_tkeys[i], &t, &v, hex) == 0 && plausible_temp(v) && v > mx) {
-            mx = v;
-            mxk = g_tkeys[i];
-        }
-    }
-    if (name_out) *name_out = mxk;
-    return mx;
 }
 
 static void print_status_line(void) {
