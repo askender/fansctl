@@ -39,15 +39,20 @@ static NSString *sh_quote(NSString *s) {
             [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
 }
 
-/* 弹管理员授权框以 root 执行 shell 命令; 取消或失败返回 NO */
+/* 弹管理员授权框以 root 执行 shell 命令; 失败返回 NO。
+   经 NSTask 调 /usr/bin/osascript (命令行 osascript 从无 Info.plist 的
+   后台进程弹授权窗已验证可用; 而进程内 NSAppleScript 会静默失败)。 */
 static BOOL run_root(NSString *shell) {
     NSString *script = [NSString stringWithFormat:
         @"do shell script %@ with administrator privileges", sh_quote(shell)];
-    NSAppleScript *as = [[NSAppleScript alloc] initWithSource:script];
-    NSDictionary *err = nil;
-    [as executeAndReturnError:&err];
-    [as release];
-    return err == nil;
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @"/usr/bin/osascript";
+    t.arguments = @[@"-e", script];
+    [t launch];
+    [t waitUntilExit];
+    BOOL ok = t.terminationStatus == 0;
+    [t release];
+    return ok;
 }
 
 static int thresh_idx(void) {
@@ -190,21 +195,32 @@ static int thresh_idx(void) {
     [self tick];
 }
 
-- (void)doMax:(id)sender   { (void)sender; run_root([NSString stringWithFormat:@"%@ __apply max",  sh_quote(self_path())]); }
-- (void)doAuto:(id)sender  { (void)sender; run_root([NSString stringWithFormat:@"%@ __apply auto", sh_quote(self_path())]); }
+- (void)flash:(NSString *)s { g_item.button.title = s; /* ≤2s 后 tick 自动刷新 */ }
+
+- (void)doMax:(id)sender {
+    (void)sender;
+    [self flash:run_root([NSString stringWithFormat:@"%@ __apply max", sh_quote(self_path())])
+           ? @"全速 ✓" : @"⚠ 授权失败"];
+}
+- (void)doAuto:(id)sender {
+    (void)sender;
+    [self flash:run_root([NSString stringWithFormat:@"%@ __apply auto", sh_quote(self_path())])
+           ? @"恢复自动 ✓" : @"⚠ 授权失败"];
+}
 
 - (void)doSmart:(id)sender {
     (void)sender;
     int pid; double slo, shi;
     if (smart_pid_read(&pid, &slo, &shi)) {
         /* smart 的 SIGTERM 处理器会恢复自动并清 pidfile */
-        run_root([NSString stringWithFormat:@"kill -TERM %d", pid]);
+        [self flash:run_root([NSString stringWithFormat:@"kill -TERM %d", pid])
+               ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
     } else {
         int idx = thresh_idx();
         NSString *sh = [NSString stringWithFormat:
             @"nohup %@ __smart %.0f %.0f >/dev/null 2>&1 &",
             sh_quote(self_path()), kThresh[idx][0], kThresh[idx][1]];
-        run_root(sh);
+        [self flash:run_root(sh) ? @"智能启动中…" : @"⚠ 授权失败"];
     }
 }
 
@@ -228,7 +244,7 @@ int bar_main(void) {
         setsid();
         freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
+        freopen("/tmp/fansctl.bar.log", "a", stderr); /* 排查日志 */
     }
     if (smc_open() != 0) return 1;
     NSApplication *app = [NSApplication sharedApplication];
