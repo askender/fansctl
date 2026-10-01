@@ -72,6 +72,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.fansctl.bar.plist
 
 RunAtLoad + 崩溃自动拉起(SuccessfulExit=false), 菜单点"退出"不复活。
 
+**开机兜底恢复** (`make install-restore`, 需一次密码): 系统级
+LaunchDaemon `/Library/LaunchDaemons/local.fansctl.restore.plist`,
+每次开机以 root 执行 `fansctl-root __apply auto` 一次——崩溃/断电后
+SMC 若残留手动模式, 开机即恢复自动, 风扇不会卡死在最后转速。
+
 ## 本机 SMC 事实 (Mac Studio M1 Max, macOS 15)
 
 - SMCKeyData 必须 80 字节(Apple Silicon), selector 2

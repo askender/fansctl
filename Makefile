@@ -15,6 +15,8 @@ install: all
 uninstall:
 	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
 	sudo rm -f /usr/local/bin/fansctl-root
+	sudo launchctl bootout system/local.fansctl.restore 2>/dev/null || true
+	sudo rm -f /Library/LaunchDaemons/local.fansctl.restore.plist
 
 # 安装 setuid root 助手: 菜单栏控制免密执行 (仅放行固定风扇动作)
 install-root: all
@@ -22,6 +24,13 @@ install-root: all
 	sudo cp fansctl /usr/local/bin/fansctl-root
 	sudo chown root:wheel /usr/local/bin/fansctl-root
 	sudo chmod 4755 /usr/local/bin/fansctl-root
+
+# 开机兜底: 系统级 LaunchDaemon, 每次开机以 root 恢复风扇自动,
+# 防止崩溃/断电后 SMC 残留手动模式把风扇卡死在最后的转速
+install-restore:
+	sudo cp local.fansctl.restore.plist /Library/LaunchDaemons/
+	sudo chown root:wheel /Library/LaunchDaemons/local.fansctl.restore.plist
+	sudo launchctl bootstrap system /Library/LaunchDaemons/local.fansctl.restore.plist 2>/dev/null || true
 
 clean:
 	rm -f fansctl
