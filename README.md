@@ -41,6 +41,8 @@ sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
 - **智能阈值** 四档子菜单: 60~95(默认) / 55~95 / 45~85 / 40~80, 存 NSUserDefaults,
   智能运行中可热更新(SIGUSR1 + pidfile, 不打断控制)
 - 点击动作后下拉自动重开; 菜单展开期间定时器也刷新(NSRunLoopCommonModes)
+- 退出(⌘Q): 智能未运行而风扇在手动时, 退出前经助手恢复自动(不留孤儿转速);
+  智能运行中退出 UI 不影响守护进程
 - 单实例守卫 `/tmp/fansctl.bar.pid`
 
 ## 智能模式

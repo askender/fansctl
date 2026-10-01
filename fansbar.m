@@ -104,6 +104,7 @@ static int thresh_idx(void) {
 - (void)doAuto:(id)sender;
 - (void)doSmart:(id)sender;
 - (void)doThresh:(id)sender;
+- (void)doQuit:(id)sender;
 @end
 
 @implementation BarDelegate
@@ -241,7 +242,7 @@ static int thresh_idx(void) {
     [menu addItem:g_threshRoot];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    it = [[NSMenuItem alloc] initWithTitle:@"退出 fansctl" action:@selector(terminate:) keyEquivalent:@"q"];
+    it = [[NSMenuItem alloc] initWithTitle:@"退出 fansctl" action:@selector(doQuit:) keyEquivalent:@"q"];
     [menu addItem:it];
     [it release];
     g_item.menu = menu;
@@ -315,6 +316,22 @@ static int thresh_idx(void) {
         [self flash:ok ? @"智能启动中…" : @"⚠ 执行失败"];
     }
     [self reopenMenu];
+}
+
+- (void)doQuit:(id)sender {
+    /* 退出 = 交还控制: 智能未运行而风扇处于手动(全速/定速孤儿)时,
+       经 setuid 助手静默恢复自动再退; 助手未装不弹密码直接退。
+       智能运行中: 守护进程独立于 UI, 退出菜单栏不影响它 */
+    int pid; double slo, shi;
+    int orphan = 0;
+    if (!smart_pid_read(&pid, &slo, &shi))
+        for (int f = 0; f < g_fan_n; f++)
+            if (fan_mode(f) == 1) { orphan = 1; break; }
+    if (orphan && access(FANSCTL_ROOT, X_OK) == 0) {
+        char *argv[] = {g_self, "__apply", "auto", NULL};
+        run_root_argv(argv);
+    }
+    [NSApp terminate:sender];
 }
 
 - (void)doThresh:(id)sender {
