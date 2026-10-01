@@ -6,6 +6,7 @@
  * set/max/auto/smart 需 root)
  * 许可证: AGPL-3.0-or-later (见 LICENSE), 商用需开源衍生代码
  */
+#include <mach/mach_time.h>
 #include "fansctl.h"
 
 /* ==================== 写入/控制 (需要 root) ==================== */
@@ -113,9 +114,10 @@ static int write_tg(int idx, double rpm) {
         fprintf(stderr, "不支持的目标键类型: %s\n", ts);
         return -1;
     }
-    for (int attempt = 0; attempt < 10; attempt++) {
+    /* 写入退避: SMC 忙(0x82 温控器占用)时指数退避重试, 总计约 1.5 秒, 不硬敲 */
+    for (int attempt = 0, ms = 50; attempt < 6; attempt++, ms *= 2) {
         if (smc_write_key(k, data, dlen) == KERN_SUCCESS) return 0;
-        usleep(50 * 1000);
+        if (attempt < 5) usleep(ms * 1000);
     }
     fprintf(stderr, "写入 %s 失败 (SMC 可能拒绝: 0x82=温控器占用, 0x86=键只读)\n", k);
     return -1;
@@ -265,6 +267,12 @@ static void on_stop_signal(int sig, siginfo_t *si, void *ctx) {
 }
 static void on_reload_signal(int sig) { (void)sig; g_reload = 1; }
 
+/* 连续时钟: 系统睡眠期间也走表 (mach_absolute_time 会停), 用于探测唤醒 */
+static mach_timebase_info_data_t g_timebase;
+static uint64_t cont_ns(void) {
+    return mach_continuous_time() * g_timebase.numer / g_timebase.denom;
+}
+
 static int smart_loop(double t_lo, double t_hi) {
     int n = fan_count();
     if (n < 1) n = 1;
@@ -283,6 +291,8 @@ static int smart_loop(double t_lo, double t_hi) {
     signal(SIGUSR1, on_reload_signal); /* __smart thresh <lo> <hi> 就地更新阈值 */
     printf("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
            t_lo, t_hi);
+    mach_timebase_info(&g_timebase);
+    uint64_t tick_ns = cont_ns();
     int rc = 0;
     while (!g_stop) {
         if (g_reload) { /* pidfile 里的新阈值就地生效, 不打断风扇控制 */
@@ -298,7 +308,16 @@ static int smart_loop(double t_lo, double t_hi) {
         }
         const char *tkey = NULL;
         double T = hottest_temp(&tkey);
-        if (T < -999) { fprintf(stderr, "温度读取失败\n"); rc = 1; break; }
+        if (T < -999) {
+            /* 睡眠唤醒等场景 SMC 连接可能短暂失效: 重开连接重试, 连续失败才放弃 */
+            for (int i = 0; i < 3 && T < -999 && !g_stop; i++) {
+                sleep(1);
+                smc_close();
+                if (smc_open() != 0) continue;
+                T = hottest_temp(&tkey);
+            }
+            if (T < -999) { fprintf(stderr, "温度读取失败(已重试)\n"); rc = 1; break; }
+        }
         double frac = (T - t_lo) / (t_hi - t_lo);
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
@@ -310,6 +329,21 @@ static int smart_loop(double t_lo, double t_hi) {
                 if (fan_auto(f) != 0) { rc = 1; break; }
                 manual[f] = 0;
                 last[f] = -1;
+            }
+            if (manual[f]) {
+                /* MODE_REASSERT: 核验手动权与目标转速, 被外部工具/系统改写
+                   (改回自动、覆盖目标)则立即重新接管或重写目标 */
+                int m = fan_mode(f);
+                double tg = -1;
+                read_rpm_key(f, "Tg", &tg);
+                if ((m >= 0 && m != 1) ||
+                    (m == 1 && tg > 0 && last[f] > 0 && fabs(tg - last[f]) > 150)) {
+                    printf("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                           f, m, tg, last[f]);
+                    fflush(stdout);
+                    if (m == 1) last[f] = -1; /* 目标被改, 本拍重写 */
+                    else { manual[f] = 0; last[f] = -1; } /* 手动权丢失, 重新接管 */
+                }
             }
             if (frac <= 0 && !manual[f]) {
                 double tg;
@@ -349,6 +383,23 @@ static int smart_loop(double t_lo, double t_hi) {
         printf("\n");
         fflush(stdout);
         sleep(1);
+        /* 唤醒让权: 1 秒拍长被拉长到 5 秒以上 = 系统刚从睡眠唤醒。
+           先交还系统控制并静置 5 秒(温控器/传感器稳定), 之后按新基线重新接管 */
+        uint64_t dt = cont_ns() - tick_ns;
+        tick_ns = cont_ns();
+        if (dt > 5ULL * 1000000000ULL) {
+            printf("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n", dt / 1e9);
+            for (int f = 0; f < n; f++)
+                if (manual[f]) {
+                    if (fan_auto(f) != 0) { rc = 1; break; }
+                    manual[f] = 0;
+                    last[f] = -1;
+                }
+            fflush(stdout);
+            if (rc != 0) break;
+            for (int i = 0; i < 5 && !g_stop; i++) sleep(1);
+            tick_ns = cont_ns();
+        }
     }
     for (int f = 0; f < n; f++)
         if (manual[f]) fan_auto(f);
@@ -376,7 +427,21 @@ static int smart_stop(void) {
     int pid; double lo, hi;
     if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
     if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
-    for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
+    /* 等守护进程完成收尾(恢复自动 + 清 pidfile)再返回, 否则它的退出清理会
+       覆盖调用方紧接着的设速(实测: stop 后立即 __apply max 被 fan_auto 覆盖)。
+       以 pidfile 消失为准(清理在恢复自动之后), 超时如实报失败而非假装成功 */
+    for (int i = 0; i < 100; i++) {
+        int p; double l, h;
+        if (!smart_pid_read(&p, &l, &h) || p != pid) break;
+        usleep(100 * 1000);
+    }
+    {
+        int p; double l, h;
+        if (smart_pid_read(&p, &l, &h) && p == pid) {
+            fprintf(stderr, "智能模式 10 秒内未完成退出, 请查 /tmp/fansctl.smart.log\n");
+            return 1;
+        }
+    }
     printf("智能模式已停止(恢复自动)\n");
     return 0;
 }
