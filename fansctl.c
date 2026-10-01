@@ -306,8 +306,11 @@ static int smart_loop(double t_lo, double t_hi) {
                 continue;
             }
             if (!manual[f]) {
+                /* 基线 = 接管瞬间系统想要的目标。但若风扇已处于手动(上个会话/
+                   全速残留), Tg 是残留的自设值而非系统意图, 不可采信, 退回 Mn */
                 double tg;
-                if (read_rpm_key(f, "Tg", &tg) == 0 && tg > mn) base[f] = tg;
+                if (fan_mode(f) == 1) base[f] = mn;
+                else if (read_rpm_key(f, "Tg", &tg) == 0 && tg > mn) base[f] = tg;
                 if (base[f] < mn) base[f] = mn;
                 if (engage_manual(f) != 0) { rc = 1; break; }
                 manual[f] = 1;
