@@ -267,15 +267,29 @@ static int thresh_idx(void) {
 
 - (void)flash:(NSString *)s { g_item.button.title = s; /* ≤2s 后 tick 自动刷新 */ }
 
+/* 点全速/自动 = 接管控制: 先停掉运行中的智能模式, 否则它每秒改回目标转速 */
+- (void)takeover:(void (^)(void))apply {
+    int pid; double slo, shi;
+    if (smart_pid_read(&pid, &slo, &shi)) {
+        char *stop[] = {g_self, "__smart", "stop", NULL};
+        if (run_root_argv(stop) != 0) { [self flash:@"⚠ 停止智能失败"]; return; }
+    }
+    apply();
+}
+
 - (void)doMax:(id)sender {
     (void)sender;
-    char *argv[] = {g_self, "__apply", "max", NULL};
-    [self flash:run_root_argv(argv) == 0 ? @"全速 ✓" : @"⚠ 授权失败"];
+    [self takeover:^{
+        char *argv[] = {g_self, "__apply", "max", NULL};
+        [self flash:run_root_argv(argv) == 0 ? @"全速 ✓" : @"⚠ 执行失败"];
+    }];
 }
 - (void)doAuto:(id)sender {
     (void)sender;
-    char *argv[] = {g_self, "__apply", "auto", NULL};
-    [self flash:run_root_argv(argv) == 0 ? @"恢复自动 ✓" : @"⚠ 授权失败"];
+    [self takeover:^{
+        char *argv[] = {g_self, "__apply", "auto", NULL};
+        [self flash:run_root_argv(argv) == 0 ? @"已恢复自动 ✓" : @"⚠ 执行失败"];
+    }];
 }
 
 - (void)doSmart:(id)sender {
