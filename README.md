@@ -3,7 +3,7 @@
 macOS SMC 风扇/温度工具, Mac Studio M1 Max (Apple Silicon) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
-版本: `fansctl version` (当前 1.0.0)。
+版本: `fansctl version` (当前 1.1.0)。
 
 ## 构建与安装
 
@@ -32,14 +32,18 @@ sudo fansctl max [N]         全速
 sudo fansctl auto [N]        恢复自动
 sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart stop 退出恢复)
 sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
+sudo fansctl hold [°C]       恒温模式, PI 闭环稳定最热传感器(默认 70°C, 与智能互斥)
+sudo fansctl hold stop       结束恒温模式(含菜单栏启动的)
 ```
 
 ## 菜单栏
 
 - 状态栏标题: `最热°C|最大转速(krpm)`, 2 秒刷新
-- **全速 / 自动 / 智能模式** 三态互斥打钩; 点全速/自动先接管(停掉智能)再应用
+- **全速 / 自动 / 智能模式 / 恒温模式** 四态互斥打钩; 点任意控制项先接管
+  (停掉运行中的智能/恒温)再应用
 - **智能阈值** 四档子菜单: 60~95(默认) / 55~95 / 45~85 / 40~80, 存 NSUserDefaults,
   智能运行中可热更新(SIGUSR1 + pidfile, 不打断控制)
+- **恒温目标** 四档子菜单: 65 / 70(默认) / 75 / 80°C, 运行中同样可热更新
 - 点击动作后下拉自动重开; 菜单展开期间定时器也刷新(NSRunLoopCommonModes)
 - 退出(⌘Q): 智能未运行而风扇在手动时, 退出前经助手恢复自动(不留孤儿转速);
   智能运行中退出 UI 不影响守护进程
@@ -65,12 +69,26 @@ SIGTERM 优雅退出(恢复自动), 日志 `/tmp/fansctl.smart.log`
   防止其退出清理覆盖调用方随后的立即设速; 超时如实报失败
 - SMC 读取失败时重开连接重试 3 次(唤醒初期连接可能短暂失效)
 
+## 恒温模式
+
+与智能模式(开环曲线)互补的**闭环**控制: 直接给定目标温度, PI 控制器把
+最热传感器稳定在目标上。
+
+- 速度形式 PI: 转速增量 = 25×Δ误差 + 8×误差 − 150×温度趋势(每秒),
+  增量限幅 ±250rpm — 无积分饱和, 趋势项抑制超调
+- 死区: 误差 <0.3°C 且温度平稳时保持转速, 防抖动
+- 低于目标 3°C 交回系统自动(风扇可停转), 回到 1.5°C 内重新接管(迟滞)
+- 与智能模式全面互斥: 任一启动会先收走另一方的控制权
+- 状态 pidfile `/tmp/fansctl.hold.pid` = "pid 目标°C", `hold stop` 等收尾;
+  日志 `/tmp/fansctl.hold.log`; 唤醒让权/MODE_REASSERT 与智能模式同款
+
 ## 免密与安全模型
 
 `/usr/local/bin/fansctl-root` (root:wheel 4755) 是本程序副本, 菜单栏经它
 免密执行特权动作。**白名单仅**: `__apply max|auto|set`、`__smart lo hi |
-stop | thresh`、`smart stop`; 每个参数有范围校验, 无 shell、无环境展开,
-不能被用作通用提权入口。助手未安装时菜单栏回退 `__ask` 子进程
+stop | thresh`、`__hold °C | stop | target`、`smart stop`; 每个参数有
+范围校验, 无 shell、无环境展开, 不能被用作通用提权入口。
+助手未安装时菜单栏回退 `__ask` 子进程
 AuthorizationExecuteWithPrivileges(每次弹密码框)。
 
 ## 开机自启

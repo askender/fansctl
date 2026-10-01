@@ -2,10 +2,11 @@
  * fansbar.m - fansctl 的菜单栏界面 (fansctl 不带参数时进入, 见 bar_main)
  *
  * 菜单:
- *   [状态区] 最热传感器/温度/曲线百分比 + 每个风扇的转速/目标 (2 秒刷新, 只读免 root)
- *   全速 / 自动 / 智能模式 -> 三态互斥打钩; 点全速/自动先接管(停掉智能)再应用
- *   智能阈值 -> 四档预设子菜单(存 NSUserDefaults), 智能运行中可热更新
- *   退出 (⌘Q)
+ *   [状态区] 最热传感器/温度/曲线百分比或恒温目标 + 每风扇转速/目标 (2 秒刷新)
+ *   全速 / 自动 / 智能模式 / 恒温模式 -> 四态互斥打钩; 点任意控制项先接管
+ *   (停掉运行中的智能/恒温)再应用
+ *   智能阈值 / 恒温目标 -> 四档预设子菜单(存 NSUserDefaults), 运行中可热更新
+ *   退出 (⌘Q): 无守护进程且风扇手动时先恢复自动
  * 特权动作走 run_root_argv: 优先 setuid 助手 fansctl-root(免密), 未安装时
  * 回退 __ask 子进程授权弹窗。动作完成后自动重开下拉, 菜单开着也持续刷新。
  *
@@ -23,10 +24,14 @@ static NSMenuItem *g_maxItem;
 static NSMenuItem *g_autoItem;
 static NSMenuItem *g_smartItem;
 static NSMenuItem *g_threshRoot;      /* "智能阈值" 父项, 子菜单为四档预设 */
+static NSMenuItem *g_holdItem;
+static NSMenuItem *g_holdTargetRoot;  /* "恒温目标" 父项, 子菜单为四档预设 */
 static int g_fan_n = 1;
 
 static const double kThresh[][2] = {{60, 95}, {55, 95}, {45, 85}, {40, 80}};
 #define KTHRESH_N ((int)(sizeof kThresh / sizeof kThresh[0]))
+static const double kHoldTarget[] = {65, 70, 75, 80};
+#define KHOLD_N ((int)(sizeof kHoldTarget / sizeof kHoldTarget[0]))
 
 static char g_self[PATH_MAX];
 
@@ -97,6 +102,12 @@ static int thresh_idx(void) {
     return (int)i;
 }
 
+static int hold_idx(void) {
+    NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:@"HoldTargetIdx"];
+    if (i < 0 || i >= KHOLD_N) i = 1; /* 默认 70°C */
+    return (int)i;
+}
+
 @interface BarDelegate : NSObject<NSApplicationDelegate>
 @property (retain) NSTimer *timer;
 - (void)tick;
@@ -104,6 +115,8 @@ static int thresh_idx(void) {
 - (void)doAuto:(id)sender;
 - (void)doSmart:(id)sender;
 - (void)doThresh:(id)sender;
+- (void)doHold:(id)sender;
+- (void)doHoldTarget:(id)sender;
 - (void)doQuit:(id)sender;
 @end
 
@@ -112,6 +125,8 @@ static int thresh_idx(void) {
 - (void)tick {
     int pid = 0; double slo = 0, shi = 0;
     int smart = smart_pid_read(&pid, &slo, &shi);
+    double ht = 0;
+    int hold = hold_pid_read(&pid, &ht);
 
     /* 标题栏: 温度|最大转速 */
     double mx_ac = -1;
@@ -127,13 +142,15 @@ static int thresh_idx(void) {
     snprintf(buf, sizeof buf, "%s|%s", tb, fb);
     g_item.button.title = U(buf);
 
-    /* 状态区第 0 行: 最热传感器 + 曲线百分比 */
+    /* 状态区第 0 行: 最热传感器 + 曲线百分比或恒温目标 */
     if (T > -999) {
         if (smart) {
             double frac = (T - slo) / (shi - slo);
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
             snprintf(buf, sizeof buf, "%s %.1f°C  曲线%.0f%%", tkey, T, frac * 100);
+        } else if (hold) {
+            snprintf(buf, sizeof buf, "%s %.1f°C  目标%.0f°C", tkey, T, ht);
         } else {
             snprintf(buf, sizeof buf, "%s %.1f°C", tkey, T);
         }
@@ -161,11 +178,12 @@ static int thresh_idx(void) {
         [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
     }
 
-    /* 三种模式互斥打钩: 当前生效的状态 */
+    /* 四种模式互斥打钩: 当前生效的状态 */
     g_smartItem.state = smart ? NSControlStateValueOn : NSControlStateValueOff;
-    g_maxItem.state  = (!smart && n_manual == g_fan_n && n_at_max == g_fan_n)
+    g_holdItem.state  = hold ? NSControlStateValueOn : NSControlStateValueOff;
+    g_maxItem.state  = (!smart && !hold && n_manual == g_fan_n && n_at_max == g_fan_n)
                        ? NSControlStateValueOn : NSControlStateValueOff;
-    g_autoItem.state = (!smart && n_manual == 0)
+    g_autoItem.state = (!smart && !hold && n_manual == 0)
                        ? NSControlStateValueOn : NSControlStateValueOff;
 
     /* 智能模式: 运行中显示当前阈值 (阈值可运行中热更新) */
@@ -178,6 +196,18 @@ static int thresh_idx(void) {
     /* 阈值子菜单: 当前档打钩 */
     int idx = thresh_idx();
     NSMenu *sub = g_threshRoot.submenu;
+    for (NSInteger i = 0; i < [sub numberOfItems]; i++)
+        [sub itemAtIndex:i].state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
+
+    /* 恒温模式: 运行中显示当前目标 (可运行中热更新) */
+    if (hold) {
+        g_holdItem.title = [NSString stringWithFormat:@"恒温模式 (→%.0f°C)", ht];
+    } else {
+        g_holdItem.title = @"恒温模式";
+    }
+    g_holdTargetRoot.enabled = YES;
+    idx = hold_idx();
+    sub = g_holdTargetRoot.submenu;
     for (NSInteger i = 0; i < [sub numberOfItems]; i++)
         [sub itemAtIndex:i].state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
 }
@@ -240,6 +270,24 @@ static int thresh_idx(void) {
     }
     [g_threshRoot setSubmenu:sub];
     [menu addItem:g_threshRoot];
+
+    g_holdItem = [[NSMenuItem alloc] initWithTitle:@"恒温模式"
+                                            action:@selector(doHold:) keyEquivalent:@""];
+    [g_holdItem setTarget:self];
+    [menu addItem:g_holdItem];
+    g_holdTargetRoot = [[NSMenuItem alloc] initWithTitle:@"恒温目标" action:nil keyEquivalent:@""];
+    sub = [[NSMenu alloc] init];
+    for (int i = 0; i < KHOLD_N; i++) {
+        NSMenuItem *hit = [[NSMenuItem alloc]
+            initWithTitle:[NSString stringWithFormat:@"%.0f°C", kHoldTarget[i]]
+                    action:@selector(doHoldTarget:) keyEquivalent:@""];
+        [hit setTarget:self];
+        [hit setTag:i];
+        [sub addItem:hit];
+        [hit release];
+    }
+    [g_holdTargetRoot setSubmenu:sub];
+    [menu addItem:g_holdTargetRoot];
     [menu addItem:[NSMenuItem separatorItem]];
 
     it = [[NSMenuItem alloc] initWithTitle:@"退出 fansctl" action:@selector(doQuit:) keyEquivalent:@"q"];
@@ -265,12 +313,18 @@ static int thresh_idx(void) {
                    dispatch_get_main_queue(), ^{ [g_item.button performClick:nil]; });
 }
 
-/* 点全速/自动 = 接管控制: 先停掉运行中的智能模式, 否则它每秒改回目标转速 */
+/* 点全速/自动/智能/恒温 = 接管控制: 先停掉运行中的其他控制器(智能/恒温),
+   否则它们每秒改回目标转速 */
 - (void)takeover:(void (^)(void))apply {
     int pid; double slo, shi;
     if (smart_pid_read(&pid, &slo, &shi)) {
         char *stop[] = {g_self, "__smart", "stop", NULL};
         if (run_root_argv(stop) != 0) { [self flash:@"⚠ 停止智能失败"]; return; }
+    }
+    double t;
+    if (hold_pid_read(&pid, &t)) {
+        char *stop[] = {g_self, "__hold", "stop", NULL};
+        if (run_root_argv(stop) != 0) { [self flash:@"⚠ 停止恒温失败"]; return; }
     }
     apply();
 }
@@ -318,13 +372,56 @@ static int thresh_idx(void) {
     [self reopenMenu];
 }
 
+- (void)doHold:(id)sender {
+    (void)sender;
+    int pid; double t;
+    if (hold_pid_read(&pid, &t)) {
+        /* 运行中点击 = 关闭 (恒温的 SIGTERM 处理器会恢复自动并清 pidfile) */
+        char *argv[] = {g_self, "__hold", "stop", NULL};
+        int ok = run_root_argv(argv) == 0;
+        [self tick];
+        [self flash:ok ? @"恒温已关闭 ✓" : @"⚠ 执行失败"];
+    } else {
+        /* 与智能互斥: 先收智能的控制权再启动恒温 */
+        int spid; double slo, shi;
+        if (smart_pid_read(&spid, &slo, &shi)) {
+            char *stop[] = {g_self, "__smart", "stop", NULL};
+            if (run_root_argv(stop) != 0) { [self flash:@"⚠ 停止智能失败"]; [self reopenMenu]; return; }
+        }
+        char tb[8];
+        snprintf(tb, sizeof tb, "%.0f", kHoldTarget[hold_idx()]);
+        char *argv[] = {g_self, "__hold", tb, NULL};
+        int ok = run_root_argv(argv) == 0;
+        [self tick];
+        [self flash:ok ? @"恒温启动中…" : @"⚠ 执行失败"];
+    }
+    [self reopenMenu];
+}
+
+- (void)doHoldTarget:(id)sender {
+    int idx = (int)[sender tag];
+    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:@"HoldTargetIdx"];
+    int pid; double t;
+    NSString *msg = nil;
+    if (hold_pid_read(&pid, &t)) {
+        /* 运行中: 热更新守护进程目标, 不打断风扇控制 */
+        char tb[8];
+        snprintf(tb, sizeof tb, "%.0f", kHoldTarget[idx]);
+        char *argv[] = {g_self, "__hold", "target", tb, NULL};
+        msg = run_root_argv(argv) == 0 ? @"目标已更新 ✓" : @"⚠ 更新失败";
+    }
+    [self tick];
+    if (msg) [self flash:msg];
+    [self reopenMenu];
+}
+
 - (void)doQuit:(id)sender {
-    /* 退出 = 交还控制: 智能未运行而风扇处于手动(全速/定速孤儿)时,
+    /* 退出 = 交还控制: 智能/恒温都未运行而风扇处于手动(全速/定速孤儿)时,
        经 setuid 助手静默恢复自动再退; 助手未装不弹密码直接退。
-       智能运行中: 守护进程独立于 UI, 退出菜单栏不影响它 */
-    int pid; double slo, shi;
+       守护进程(智能/恒温)独立于 UI, 退出菜单栏不影响它们 */
+    int pid; double slo, shi, t;
     int orphan = 0;
-    if (!smart_pid_read(&pid, &slo, &shi))
+    if (!smart_pid_read(&pid, &slo, &shi) && !hold_pid_read(&pid, &t))
         for (int f = 0; f < g_fan_n; f++)
             if (fan_mode(f) == 1) { orphan = 1; break; }
     if (orphan && access(FANSCTL_ROOT, X_OK) == 0) {

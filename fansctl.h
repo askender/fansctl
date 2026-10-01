@@ -11,7 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.0.0"
+#define FANSCTL_VERSION "1.1.0"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
@@ -255,6 +255,33 @@ static inline void smart_pid_write(double lo, double hi) {
 }
 
 static inline void smart_pid_clear(void) { unlink(SMART_PIDFILE); }
+
+/* ==================== 恒温模式状态 (与智能模式互斥) ==================== */
+
+#define HOLD_PIDFILE "/tmp/fansctl.hold.pid"
+
+/* 内容: "<pid> <目标°C>"。进程已死则顺手清掉残留文件 */
+static inline int hold_pid_read(int *pid_out, double *t_out) {
+    FILE *f = fopen(HOLD_PIDFILE, "r");
+    if (!f) return 0;
+    int pid = 0; double t = 0;
+    int ok = fscanf(f, "%d %lf", &pid, &t) == 2;
+    fclose(f);
+    if (!ok) { unlink(HOLD_PIDFILE); return 0; }
+    if (kill(pid, 0) != 0 && errno == ESRCH) { unlink(HOLD_PIDFILE); return 0; }
+    if (pid_out) *pid_out = pid;
+    if (t_out) *t_out = t;
+    return 1;
+}
+
+static inline void hold_pid_write(double t) {
+    FILE *f = fopen(HOLD_PIDFILE, "w");
+    if (!f) return;
+    fprintf(f, "%d %.1f\n", (int)getpid(), t);
+    fclose(f);
+}
+
+static inline void hold_pid_clear(void) { unlink(HOLD_PIDFILE); }
 
 /* 菜单栏界面 (fansbar.m): 无参数启动时进入 */
 int bar_main(void);

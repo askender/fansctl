@@ -446,6 +446,209 @@ static int smart_stop(void) {
     return 0;
 }
 
+/* ==================== 恒温模式 (需 root, PI 闭环, Ctrl+C 退出并恢复自动) ==================== */
+
+/* 与 smart_stop 同款"等收尾"语义 */
+static int hold_stop(void) {
+    int pid; double t;
+    if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "恒温模式未在运行\n"); return 1; }
+    if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
+    for (int i = 0; i < 100; i++) {
+        int p; double x;
+        if (!hold_pid_read(&p, &x) || p != pid) break;
+        usleep(100 * 1000);
+    }
+    {
+        int p; double x;
+        if (hold_pid_read(&p, &x) && p == pid) {
+            fprintf(stderr, "恒温模式 10 秒内未完成退出, 请查 /tmp/fansctl.hold.log\n");
+            return 1;
+        }
+    }
+    printf("恒温模式已停止(恢复自动)\n");
+    return 0;
+}
+
+/* PI 闭环: 转速增量 = Kp*(e-e_prev) + Ki*e + Kd*dT (速度形式, 天然无积分饱和;
+   dT 为趋势项, 温度已在下降时提前收油门, 抑制超调)。
+   控制输入用 EMA 平滑温度(α=0.3) — 最热传感器秒级抖动可达 ±3°C, 直接进 PI 会锯齿。
+   死区(|e|<0.3 且 |dT|<0.05)内保持防抖; 低于目标 3°C 让权系统自动(风扇可停转),
+   回到 1.5°C 内重新接管; 每拍增量限幅 ±250rpm 防跳变 */
+static int hold_loop(double t_set) {
+    int n = fan_count();
+    if (n < 1) n = 1;
+    double base[10] = {0};   /* 接管时的起始转速 */
+    double rpm[10] = {0}, last[10];
+    int manual[10] = {0};
+    for (int i = 0; i < 10; i++) last[i] = -1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sa.sa_sigaction = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGUSR1, on_reload_signal); /* __hold target <°C> 就地更新目标 */
+    printf("恒温模式: 目标最热传感器 %.1f°C, PI 闭环控制; Ctrl+C 退出并恢复自动\n", t_set);
+    mach_timebase_info(&g_timebase);
+    uint64_t tick_ns = cont_ns();
+    double e_prev = 0, t_prev = -999;
+    int rc = 0;
+    while (!g_stop) {
+        if (g_reload) { /* pidfile 里的新目标就地生效, 不打断控制 */
+            g_reload = 0;
+            int p; double nt = 0;
+            if (hold_pid_read(&p, &nt) && p == (int)getpid() && nt >= 30 && nt <= 110) {
+                t_set = nt;
+                printf("[目标更新为 %.1f°C]\n", t_set);
+                fflush(stdout);
+            }
+        }
+        const char *tkey = NULL;
+        double T = hottest_temp(&tkey);
+        if (T < -999) {
+            for (int i = 0; i < 3 && T < -999 && !g_stop; i++) {
+                sleep(1);
+                smc_close();
+                if (smc_open() != 0) continue;
+                T = hottest_temp(&tkey);
+            }
+            if (T < -999) { fprintf(stderr, "温度读取失败(已重试)\n"); rc = 1; break; }
+        }
+        double Ts = t_prev > -999 ? t_prev + 0.3 * (T - t_prev) : T; /* EMA 平滑 */
+        double e = Ts - t_set;
+        double dT = t_prev > -999 ? Ts - t_prev : 0;
+        for (int f = 0; f < n; f++) {
+            double mn = 0, mx = 6000;
+            read_rpm_key(f, "Mn", &mn);
+            read_rpm_key(f, "Mx", &mx);
+            if (manual[f] && Ts < t_set - 3.0) { /* 让权迟滞: 远低于目标交给系统 */
+                if (fan_auto(f) != 0) { rc = 1; break; }
+                manual[f] = 0;
+                last[f] = -1;
+            }
+            if (manual[f]) { /* MODE_REASSERT: 手动权/目标被外部改写则重新接管 */
+                int m = fan_mode(f);
+                double tg = -1;
+                read_rpm_key(f, "Tg", &tg);
+                if ((m >= 0 && m != 1) ||
+                    (m == 1 && tg > 0 && last[f] > 0 && fabs(tg - last[f]) > 150)) {
+                    printf("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                           f, m, tg, last[f]);
+                    fflush(stdout);
+                    if (m == 1) last[f] = -1;
+                    else { manual[f] = 0; last[f] = -1; }
+                }
+            }
+            if (!manual[f] && Ts > t_set - 1.5) { /* 回到迟滞带内重新接管 */
+                double tg = -1, ac = -1;
+                read_rpm_key(f, "Tg", &tg);
+                read_rpm_key(f, "Ac", &ac);
+                if (fan_mode(f) == 1) base[f] = mn;          /* 手动残留, Tg 不可信 */
+                else if (tg >= mn && tg <= mx) base[f] = tg; /* 系统当前意图 */
+                else if (ac > mn) base[f] = ac; /* 刚停其他控制器, Tg 还没恢复 */
+                if (base[f] < mn) base[f] = mn;
+                if (engage_manual(f) != 0) { rc = 1; break; }
+                manual[f] = 1;
+                rpm[f] = base[f];
+                last[f] = -1;
+            }
+            if (!manual[f]) continue;
+            double delta = 0;
+            if (!(fabs(e) < 0.3 && fabs(dT) < 0.05))
+                delta = 25.0 * (e - e_prev) + 8.0 * e + 150.0 * dT;
+            if (delta > 250) delta = 250;
+            if (delta < -250) delta = -250;
+            rpm[f] += delta;
+            if (rpm[f] < mn) rpm[f] = mn;
+            if (rpm[f] > mx) rpm[f] = mx;
+            if (last[f] < 0 || fabs(rpm[f] - last[f]) > 10) {
+                if (write_tg(f, rpm[f]) != 0) { rc = 1; break; }
+                last[f] = rpm[f];
+            }
+        }
+        if (rc != 0) break;
+        printf("[→%.1f°C] %s %.1f°C(平%.1f) 误差%+.1f 趋势%+.2f |",
+               t_set, tkey ? tkey : "?", T, Ts, e, dT);
+        for (int f = 0; f < n; f++) {
+            double ac = -1;
+            read_rpm_key(f, "Ac", &ac);
+            if (manual[f]) printf(" 风扇%d %6.0f→%.0f 手动", f, ac, rpm[f]);
+            else           printf(" 风扇%d %6.0f rpm 自动", f, ac);
+        }
+        printf("\n");
+        fflush(stdout);
+        e_prev = e;
+        t_prev = Ts;
+        sleep(1);
+        /* 唤醒让权 (与智能模式同款) */
+        uint64_t dt = cont_ns() - tick_ns;
+        tick_ns = cont_ns();
+        if (dt > 5ULL * 1000000000ULL) {
+            printf("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n", dt / 1e9);
+            for (int f = 0; f < n; f++)
+                if (manual[f]) {
+                    if (fan_auto(f) != 0) { rc = 1; break; }
+                    manual[f] = 0;
+                    last[f] = -1;
+                }
+            fflush(stdout);
+            if (rc != 0) break;
+            for (int i = 0; i < 5 && !g_stop; i++) sleep(1);
+            tick_ns = cont_ns();
+            t_prev = -999; /* 唤醒后第一拍无趋势 */
+        }
+    }
+    for (int f = 0; f < n; f++)
+        if (manual[f]) fan_auto(f);
+    if (g_stop) {
+        printf("\n已退出恒温模式, 全部恢复自动");
+        if (g_stop_pid > 0) printf(" (停止信号来自 pid %d)", (int)g_stop_pid);
+        printf("\n");
+    }
+    return rc;
+}
+
+/* fansctl __hold <°C> — root 后台运行的恒温模式 (菜单栏启动), pidfile 标记状态。
+   自行 fork 守护化 (与 __smart 同款)。argv[2]=="stop"/"target" 给 setuid 助手用。 */
+static int hold_hidden_cmd(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[2], "stop") == 0) return hold_stop();
+    if (argc > 2 && strcmp(argv[2], "target") == 0) {
+        /* 更新运行中恒温模式的目标: 改 pidfile + SIGUSR1, 守护进程就地生效 */
+        if (argc < 4) { fprintf(stderr, "用法: __hold target <°C>\n"); return 1; }
+        double nt = atof(argv[3]);
+        if (nt < 30 || nt > 110) { fprintf(stderr, "目标温度无效\n"); return 1; }
+        int pid; double t;
+        if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "恒温模式未在运行\n"); return 1; }
+        FILE *f = fopen(HOLD_PIDFILE, "w");
+        if (!f) { perror("pidfile"); return 1; }
+        fprintf(f, "%d %.1f\n", pid, nt);
+        fclose(f);
+        if (kill(pid, SIGUSR1) != 0) { perror("kill"); return 1; }
+        printf("已通知恒温模式更新目标 %.1f°C\n", nt);
+        return 0;
+    }
+    double t_set = argc > 2 ? atof(argv[2]) : 70;
+    if (t_set < 30 || t_set > 110) return 1;
+    int pid; double t;
+    if (hold_pid_read(&pid, &t)) return 1; /* 已有实例在跑 */
+    int spid; double slo, shi;
+    if (smart_pid_read(&spid, &slo, &shi)) smart_stop(); /* 互斥: 先收智能的控制权 */
+    pid_t d = fork();
+    if (d < 0) return 1;
+    if (d > 0) _exit(0);
+    setsid();
+    freopen("/dev/null", "r", stdin);
+    freopen("/tmp/fansctl.hold.log", "a", stdout);
+    freopen("/tmp/fansctl.hold.log", "a", stderr);
+    if (smc_open() != 0) return 1;
+    hold_pid_write(t_set);
+    int rc = hold_loop(t_set);
+    hold_pid_clear();
+    smc_close();
+    return rc;
+}
+
 /* fansctl __apply max|auto|set <rpm>  — 静默作用于全部风扇, 给菜单栏用 */
 static int apply_cmd(int argc, char **argv) {
     if (argc < 3) return 1;
@@ -493,6 +696,8 @@ static int smart_hidden_cmd(int argc, char **argv) {
     if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) return 1;
     int pid; double a, b;
     if (smart_pid_read(&pid, &a, &b)) return 1; /* 已有实例在跑 */
+    int hpid; double hx;
+    if (hold_pid_read(&hpid, &hx)) hold_stop(); /* 互斥: 先收恒温的控制权 */
     pid_t d = fork();
     if (d < 0) return 1;
     if (d > 0) _exit(0);
@@ -529,11 +734,13 @@ int main(int argc, char **argv) {
         /* setuid 助手上下文 (/usr/local/bin/fansctl-root): 只放行固定风扇动作,
            严防被用作通用提权入口 */
         int ok = strcmp(cmd, "__apply") == 0 || strcmp(cmd, "__smart") == 0 ||
+                 strcmp(cmd, "__hold") == 0 ||
                  (strcmp(cmd, "smart") == 0 && argc >= 3 && strcmp(argv[2], "stop") == 0);
         if (!ok) { fprintf(stderr, "setuid 助手只允许风扇操作\n"); return 1; }
     }
     if (strcmp(cmd, "__apply") == 0) return apply_cmd(argc, argv);
     if (strcmp(cmd, "__smart") == 0) return smart_hidden_cmd(argc, argv);
+    if (strcmp(cmd, "__hold") == 0) return hold_hidden_cmd(argc, argv);
     if (strcmp(cmd, "__ask") == 0) return ask_main(argc, argv);
     g_debug = getenv("FANSCTL_DEBUG") != NULL;
     if (smc_open() != 0) return 1;
@@ -617,9 +824,35 @@ int main(int argc, char **argv) {
                         pid, a, b);
                 rc = 1;
             } else {
+                int hpid; double hx;
+                if (hold_pid_read(&hpid, &hx)) hold_stop(); /* 互斥: 先收恒温的控制权 */
                 smart_pid_write(t_lo, t_hi);
                 rc = smart_loop(t_lo, t_hi);
                 smart_pid_clear();
+            }
+        }
+    } else if (strcmp(cmd, "hold") == 0) {
+        if (geteuid() != 0) {
+            fprintf(stderr, "需要 root 权限:  sudo fansctl hold <目标°C> | stop\n");
+            rc = 1;
+        } else if (argc > 2 && strcmp(argv[2], "stop") == 0) {
+            rc = hold_stop();
+        } else {
+            double t_set = argc > 2 ? atof(argv[2]) : 70;
+            int hpid; double hx;
+            if (t_set < 30 || t_set > 110) {
+                fprintf(stderr, "目标无效: 需 30~110°C\n");
+                rc = 1;
+            } else if (hold_pid_read(&hpid, &hx)) {
+                fprintf(stderr, "恒温模式已在运行 (pid %d, →%.1f°C), 先 sudo fansctl hold stop\n",
+                        hpid, hx);
+                rc = 1;
+            } else {
+                int spid; double slo, shi;
+                if (smart_pid_read(&spid, &slo, &shi)) smart_stop(); /* 互斥 */
+                hold_pid_write(t_set);
+                rc = hold_loop(t_set);
+                hold_pid_clear();
             }
         }
     } else {
@@ -636,6 +869,9 @@ int main(int argc, char **argv) {
             "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
             "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
             "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
+            "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
+            "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
+            "  hold stop       结束恒温模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
             "  version         版本号\n");
         smc_close();
         return 1;
