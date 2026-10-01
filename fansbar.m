@@ -184,12 +184,13 @@ static int hold_idx(void) {
     } else {
         off = snprintf(buf, sizeof buf, "温度读取失败");
     }
-    if (pw > 0 && pw < 1000) {
-        pw -= read_charge_watts(); /* 扣除充电分量: 入电池, 非机器消耗 */
-        if (pw < 0) pw = 0;
+    if (pw > 0 && pw < 1000 && off > 0 && (size_t)off < sizeof buf - 20) {
+        double cw = read_charge_watts(); /* 充电分量: 入电池, 非机器消耗 */
+        if (cw > 0 && pw - cw > 0)
+            snprintf(buf + off, sizeof buf - (size_t)off, "  %.0fW+%.0fW充", pw - cw, cw);
+        else if (pw - cw > 0)
+            snprintf(buf + off, sizeof buf - (size_t)off, "  %.0fW", pw - cw);
     }
-    if (pw > 0 && off > 0 && (size_t)off < sizeof buf - 8)
-        snprintf(buf + off, sizeof buf - (size_t)off, "  %.0fW", pw);
     if ([g_infoItems count] > 0)
         [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
 
