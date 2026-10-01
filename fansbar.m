@@ -18,6 +18,8 @@
 
 static NSStatusItem *g_item;
 static NSMutableArray *g_infoItems;   /* 状态区: 第 0 行温度, 之后每风扇一行 */
+static NSMenuItem *g_maxItem;
+static NSMenuItem *g_autoItem;
 static NSMenuItem *g_smartItem;
 static NSMenuItem *g_threshRoot;      /* "智能阈值" 父项, 子菜单为四档预设 */
 static int g_fan_n = 1;
@@ -150,26 +152,37 @@ static int thresh_idx(void) {
     if ([g_infoItems count] > 0)
         [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
 
-    /* 每风扇一行: 当前 (目标) 模式 */
+    /* 每风扇一行: 当前 (目标) 模式; 同时统计控制状态 */
+    int n_manual = 0, n_at_max = 0;
     for (int f = 0; f < g_fan_n && (NSInteger)(f + 1) < [g_infoItems count]; f++) {
-        double ac = -1, tg = -1;
+        double ac = -1, tg = -1, mx = -1;
         read_rpm_key(f, "Ac", &ac);
         read_rpm_key(f, "Tg", &tg);
+        read_rpm_key(f, "Mx", &mx);
         int mode = fan_mode(f);
+        if (mode == 1) {
+            n_manual++;
+            if (mx > 0 && tg >= mx - 50) n_at_max++;
+        }
         const char *ms = mode == 1 ? "手动" : mode == 0 ? "自动" : "未知";
         if (tg < 0) snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm  %s", f, ac, ms);
         else        snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm (目标 %.0f)  %s", f, ac, tg, ms);
         [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
     }
 
-    /* 智能模式: 运行中打钩并显示当前阈值 */
+    /* 三种模式互斥打钩: 当前生效的状态 */
+    g_smartItem.state = smart ? NSControlStateValueOn : NSControlStateValueOff;
+    g_maxItem.state  = (!smart && n_manual == g_fan_n && n_at_max == g_fan_n)
+                       ? NSControlStateValueOn : NSControlStateValueOff;
+    g_autoItem.state = (!smart && n_manual == 0)
+                       ? NSControlStateValueOn : NSControlStateValueOff;
+
+    /* 智能模式: 运行中显示当前阈值 */
     if (smart) {
         g_smartItem.title = [NSString stringWithFormat:@"智能模式 (%.0f~%.0f°C)", slo, shi];
-        g_smartItem.state = NSControlStateValueOn;
         g_threshRoot.enabled = NO;
     } else {
         g_smartItem.title = @"智能模式";
-        g_smartItem.state = NSControlStateValueOff;
         g_threshRoot.enabled = YES;
     }
     /* 阈值子菜单: 当前档打钩 */
@@ -212,14 +225,12 @@ static int thresh_idx(void) {
     }
     [menu addItem:[NSMenuItem separatorItem]];
 
-    it = [[NSMenuItem alloc] initWithTitle:@"全速" action:@selector(doMax:) keyEquivalent:@""];
-    [it setTarget:self];
-    [menu addItem:it];
-    [it release];
-    it = [[NSMenuItem alloc] initWithTitle:@"恢复自动" action:@selector(doAuto:) keyEquivalent:@""];
-    [it setTarget:self];
-    [menu addItem:it];
-    [it release];
+    g_maxItem = [[NSMenuItem alloc] initWithTitle:@"全速" action:@selector(doMax:) keyEquivalent:@""];
+    [g_maxItem setTarget:self];
+    [menu addItem:g_maxItem];
+    g_autoItem = [[NSMenuItem alloc] initWithTitle:@"自动" action:@selector(doAuto:) keyEquivalent:@""];
+    [g_autoItem setTarget:self];
+    [menu addItem:g_autoItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
     g_smartItem = [[NSMenuItem alloc] initWithTitle:@"智能模式"
