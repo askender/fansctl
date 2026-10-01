@@ -290,7 +290,9 @@ static void print_status_line(void) {
 /* ==================== 智能模式 (需 root, Ctrl+C 退出并恢复自动) ==================== */
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_reload = 0;
 static void on_stop_signal(int sig) { (void)sig; g_stop = 1; }
+static void on_reload_signal(int sig) { (void)sig; g_reload = 1; }
 
 static int smart_loop(double t_lo, double t_hi) {
     int n = fan_count();
@@ -301,10 +303,22 @@ static int smart_loop(double t_lo, double t_hi) {
     for (int i = 0; i < 10; i++) last[i] = -1;
     signal(SIGINT, on_stop_signal);
     signal(SIGTERM, on_stop_signal);
+    signal(SIGUSR1, on_reload_signal); /* __smart thresh <lo> <hi> 就地更新阈值 */
     printf("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
            t_lo, t_hi);
     int rc = 0;
     while (!g_stop) {
+        if (g_reload) { /* pidfile 里的新阈值就地生效, 不打断风扇控制 */
+            g_reload = 0;
+            int p; double nl = 0, nh = 0;
+            if (smart_pid_read(&p, &nl, &nh) && p == (int)getpid() &&
+                nl >= 20 && nh >= nl + 5 && nh <= 120) {
+                t_lo = nl;
+                t_hi = nh;
+                printf("[阈值更新为 %.0f~%.0f°C]\n", t_lo, t_hi);
+                fflush(stdout);
+            }
+        }
         const char *tkey = NULL;
         double T = hottest_temp(&tkey);
         if (T < -999) { fprintf(stderr, "温度读取失败\n"); rc = 1; break; }
@@ -404,6 +418,21 @@ static int smart_hidden_cmd(int argc, char **argv) {
         if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
         for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
         printf("智能模式已停止(恢复自动)\n");
+        return 0;
+    }
+    if (argc > 2 && strcmp(argv[2], "thresh") == 0) {
+        /* 更新运行中智能模式的阈值: 改 pidfile + SIGUSR1, 守护进程就地生效 */
+        if (argc < 5) { fprintf(stderr, "用法: __smart thresh <低°C> <高°C>\n"); return 1; }
+        double nl = atof(argv[3]), nh = atof(argv[4]);
+        if (nl < 20 || nh < nl + 5 || nh > 120) { fprintf(stderr, "阈值无效\n"); return 1; }
+        int pid; double lo, hi;
+        if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
+        FILE *f = fopen(SMART_PIDFILE, "w");
+        if (!f) { perror("pidfile"); return 1; }
+        fprintf(f, "%d %.0f %.0f\n", pid, nl, nh);
+        fclose(f);
+        if (kill(pid, SIGUSR1) != 0) { perror("kill"); return 1; }
+        printf("已通知智能模式更新阈值 %.0f~%.0f°C\n", nl, nh);
         return 0;
     }
     double t_lo = argc > 2 ? atof(argv[2]) : 40;

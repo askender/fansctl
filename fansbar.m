@@ -177,14 +177,13 @@ static int thresh_idx(void) {
     g_autoItem.state = (!smart && n_manual == 0)
                        ? NSControlStateValueOn : NSControlStateValueOff;
 
-    /* 智能模式: 运行中显示当前阈值 */
+    /* 智能模式: 运行中显示当前阈值 (阈值可运行中热更新) */
     if (smart) {
         g_smartItem.title = [NSString stringWithFormat:@"智能模式 (%.0f~%.0f°C)", slo, shi];
-        g_threshRoot.enabled = NO;
     } else {
         g_smartItem.title = @"智能模式";
-        g_threshRoot.enabled = YES;
     }
+    g_threshRoot.enabled = YES;
     /* 阈值子菜单: 当前档打钩 */
     int idx = thresh_idx();
     NSMenu *sub = g_threshRoot.submenu;
@@ -310,7 +309,17 @@ static int thresh_idx(void) {
 }
 
 - (void)doThresh:(id)sender {
-    [[NSUserDefaults standardUserDefaults] setInteger:[sender tag] forKey:@"SmartThreshIdx"];
+    int idx = (int)[sender tag];
+    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:@"SmartThreshIdx"];
+    int pid; double slo, shi;
+    if (smart_pid_read(&pid, &slo, &shi)) {
+        /* 运行中: 热更新守护进程阈值, 不打断风扇控制 */
+        char lo[8], hi[8];
+        snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
+        snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
+        char *argv[] = {g_self, "__smart", "thresh", lo, hi, NULL};
+        [self flash:run_root_argv(argv) == 0 ? @"阈值已更新 ✓" : @"⚠ 更新失败"];
+    }
     [self tick];
 }
 
