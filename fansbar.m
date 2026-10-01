@@ -37,27 +37,12 @@ static char g_self[PATH_MAX];
 
 static NSString *U(const char *s) { return [NSString stringWithUTF8String:s ? s : "?"]; }
 
-/* 电池充电功率 W (IOKit 直读 AppleSmartBattery, 无子进程)。PSTR 是适配器
-   输入功率, 含充电分量——那部分能量存进电池而非机器消耗, 显示时扣除
-   (口径借自 fanctl; Amperage>50mA 才算充电, 滤放电/满电噪声) */
+/* 电池充电功率 W: 复用 fansctl.h 的 power_read (PSTR 是适配器输入功率,
+   含充电分量——那部分能量存进电池而非机器消耗, 显示时扣除) */
 static double read_charge_watts(void) {
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
-                                                   IOServiceMatching("AppleSmartBattery"));
-    if (!svc) return 0;
-    CFMutableDictionaryRef props = NULL;
-    kern_return_t r = IORegistryEntryCreateCFProperties(svc, &props,
-                                                        kCFAllocatorDefault, kNilOptions);
-    IOObjectRelease(svc);
-    if (r != KERN_SUCCESS || !props) return 0;
-    double w = 0;
-    CFNumberRef amp = CFDictionaryGetValue(props, CFSTR("Amperage"));
-    CFNumberRef mv = CFDictionaryGetValue(props, CFSTR("Voltage"));
-    SInt32 a = 0, v = 0;
-    if (amp && CFNumberGetValue(amp, kCFNumberSInt32Type, &a) &&
-        mv && CFNumberGetValue(mv, kCFNumberSInt32Type, &v) && a > 50 && v > 0)
-        w = (double)a * v / 1e6;
-    CFRelease(props);
-    return w;
+    struct power_info p;
+    if (power_read(&p) != 0) return 0;
+    return p.charge_w;
 }
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

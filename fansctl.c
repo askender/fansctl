@@ -7,6 +7,8 @@
  * 许可证: AGPL-3.0-or-later (见 LICENSE), 商用需开源衍生代码
  */
 #include <mach/mach_time.h>
+#include <IOKit/IOCFPlugIn.h>
+#include <IOKit/usb/IOUSBLib.h>
 #include "fansctl.h"
 
 /* ==================== 写入/控制 (需要 root) ==================== */
@@ -419,6 +421,131 @@ static void watch_loop(int interval) {
     }
 }
 
+/* ==================== 功率/供电一览 (只读, 无需 root) ==================== */
+
+/* USB 设备声明的电流需求: 读配置描述符 bMaxPower (内核缓存, 不产生总线流量)。
+   USB2 单位 2mA, USB3+ 单位 8mA; bmAttributes 位6 = 自供电。
+   这是设备自报的 5V 需求——macOS 无公开接口查询外设实际拉取功率/PD 协商结果 */
+static int usb_declared_ma(io_object_t service, int bcd_usb, int *self_powered) {
+    IOCFPlugInInterface **plug = NULL;
+    SInt32 score = 0;
+    if (self_powered) *self_powered = 0;
+    if (IOCreatePlugInInterfaceForService(service, kIOUSBDeviceUserClientTypeID,
+                                          kIOCFPlugInInterfaceID, &plug, &score) != KERN_SUCCESS)
+        return -1;
+    IOUSBDeviceInterface **usb = NULL;
+    int ma = -1;
+    if ((*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID197),
+                                (LPVOID *)&usb) == S_OK && usb) {
+        IOUSBConfigurationDescriptorPtr cfg = NULL;
+        (*usb)->USBDeviceOpen(usb); /* 有的固件要求 open 才给描述符; 失败也继续读缓存 */
+        if ((*usb)->GetConfigurationDescriptorPtr(usb, 0, &cfg) == kIOReturnSuccess &&
+            cfg && cfg->bLength >= 9) {
+            ma = (int)cfg->MaxPower * (bcd_usb >= 0x0300 ? 8 : 2);
+            if (self_powered) *self_powered = (cfg->bmAttributes & 0x40) ? 1 : 0;
+        }
+        (*usb)->USBDeviceClose(usb);
+        (*usb)->Release(usb);
+    }
+    (*plug)->Release(plug);
+    return ma;
+}
+
+static void print_usb_power(void) {
+    io_iterator_t it = MACH_PORT_NULL;
+    printf("USB 设备 (声明的 5V 电流需求, 非实测):\n");
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS) {
+        printf("  枚举失败\n");
+        return;
+    }
+    io_object_t dev;
+    int n = 0;
+    while ((dev = IOIteratorNext(it)) != 0) {
+        CFMutableDictionaryRef props = NULL;
+        if (IORegistryEntryCreateCFProperties(dev, &props,
+                                              kCFAllocatorDefault, kNilOptions) != KERN_SUCCESS || !props) {
+            IOObjectRelease(dev);
+            continue;
+        }
+        char name[128] = "", vendor[128] = "";
+        CFStringRef s = CFDictionaryGetValue(props, CFSTR("USB Product Name"));
+        if (s && CFGetTypeID(s) == CFStringGetTypeID())
+            CFStringGetCString(s, name, sizeof name, kCFStringEncodingUTF8);
+        s = CFDictionaryGetValue(props, CFSTR("USB Vendor Name"));
+        if (s && CFGetTypeID(s) == CFStringGetTypeID())
+            CFStringGetCString(s, vendor, sizeof vendor, kCFStringEncodingUTF8);
+        if (name[0]) { /* 无产品名的节点(罕见)跳过 */
+            double spd = cfnum_to_double(CFDictionaryGetValue(props, CFSTR("Device Speed")));
+            double bcd = cfnum_to_double(CFDictionaryGetValue(props, CFSTR("bcdUSB")));
+            const char *sp = "";
+            if (spd >= 0 && spd <= 6) {
+                static const char *spds[] =
+                    {"1.5 Mb/s", "12 Mb/s", "480 Mb/s", "5 Gb/s", "10 Gb/s", "10 Gb/s", "20 Gb/s"};
+                sp = spds[(int)spd];
+            }
+            int selfp = 0;
+            int ma = usb_declared_ma(dev, bcd > 0 ? (int)bcd : 0, &selfp);
+            if (ma > 0)
+                printf("  - %s (%s)  %s  %d mA ≈ %.1f W%s\n", name, vendor, sp, ma,
+                       ma * 5.0 / 1000.0, selfp ? " [自供电]" : "");
+            else
+                printf("  - %s (%s)  %s  电流未知\n", name, vendor, sp);
+            n++;
+        }
+        CFRelease(props);
+        IOObjectRelease(dev);
+    }
+    IOObjectRelease(it);
+    if (!n) printf("  (无 USB 设备)\n");
+}
+
+static int power_cmd(void) {
+    struct power_info p;
+    int has_batt = power_read(&p) == 0;
+    /* 机器功率: PSTR 秒级实时, 与菜单栏第一行同源; 充电时拆出充电分量 */
+    double pw = -1;
+    read_key_value("PSTR", NULL, &pw, NULL);
+    if (pw > 0 && pw < 1000) {
+        if (p.charge_w > 0 && pw > p.charge_w)
+            printf("机器功率: %.0f W (PSTR) = 系统 %.0f W + 充电 %.0f W\n",
+                   pw, pw - p.charge_w, p.charge_w);
+        else
+            printf("机器功率: %.0f W (PSTR, 秒级实时)\n", pw);
+    } else {
+        printf("机器功率: 未知 (本机无 PSTR 键)\n");
+    }
+    if (p.sys_v > 0 && p.sys_i > 0) {
+        double w = p.sys_w > 0 ? p.sys_w : p.sys_v * p.sys_i;
+        printf("电源输入: %.1f V × %.2f A = %.1f W (实测, 遥测约分钟级刷新)\n",
+               p.sys_v, p.sys_i, w);
+    } else if (p.ext) {
+        printf("电源输入: 已连接 (无实时遥测)\n");
+    } else {
+        printf("电源输入: 未连接 (电池供电)\n");
+    }
+    if (p.adapter_w > 0) {
+        char av[32] = "";
+        if (p.adapter_v > 0) snprintf(av, sizeof av, ", 协商 %d V", p.adapter_v);
+        printf("适配器: %d W 额定%s\n", p.adapter_w, av);
+    } else if (p.ext) {
+        printf("适配器: 已连接 (额定功率未知)\n");
+    }
+    if (has_batt) {
+        if (p.charging && p.charge_w > 0)
+            printf("电池: 充电中 %.2f V / %.0f mA (%.1f W)\n", p.batt_v, p.batt_a, p.charge_w);
+        else if (p.batt_a < -50)
+            printf("电池: 放电 %.2f V / %.0f mA (%.1f W)\n",
+                   p.batt_v, -p.batt_a, -p.batt_a * p.batt_v / 1000.0);
+        else
+            printf("电池: %.2f V / %.0f mA (未充放)\n", p.batt_v, p.batt_a);
+    } else {
+        printf("电池: 本机无电池\n");
+    }
+    print_usb_power();
+    return 0;
+}
+
 /* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
 
 /* 结束运行中的智能模式: SIGTERM 优雅退出(其信号处理器恢复自动并清 pidfile)。
@@ -752,6 +879,8 @@ int main(int argc, char **argv) {
         print_status();
     } else if (strcmp(cmd, "temps") == 0) {
         print_temps();
+    } else if (strcmp(cmd, "power") == 0) {
+        power_cmd();
     } else if (strcmp(cmd, "dump") == 0) {
         print_dump();
     } else if (strcmp(cmd, "watch") == 0) {
@@ -862,6 +991,7 @@ int main(int argc, char **argv) {
             "  fans            风扇转速(只读)\n"
             "  status          风扇当前/目标转速与模式\n"
             "  temps           所有温度传感器\n"
+            "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备\n"
             "  dump            导出全部 SMC 键\n"
             "  watch [秒]      循环刷新\n"
             "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"

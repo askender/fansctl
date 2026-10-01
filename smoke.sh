@@ -16,6 +16,9 @@ echo "[status] 转速与模式"
 echo "[temps] 温度传感器"
 [ "$(./fansctl temps | grep -c '°C')" -ge 1 ] && ok "有温度读数" || bad "temps 无温度"
 
+echo "[power] 供电/功率一览"
+./fansctl power | grep -q "功率" && ok "有功率输出" || bad "power 无输出"
+
 echo "[dump] 全量键导出 (回归: 曾因 >26 字节键 hex 拼接越界 SIGABRT)"
 ./fansctl dump > /dev/null 2>&1 && ok "完整导出不崩" || bad "dump 崩溃"
 

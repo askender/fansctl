@@ -3,7 +3,7 @@
 macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
-版本: `fansctl version` (当前 1.1.0)。
+版本: `fansctl version` (当前 1.2.0)。
 
 ## 构建与安装
 
@@ -25,6 +25,7 @@ fansctl               启动菜单栏应用(fork 后台, 不占终端)
 fansctl fans          列出风扇转速(只读)
 fansctl status        当前/目标转速与模式(只读)
 fansctl temps         所有温度传感器(只读)
+fansctl power         供电/功率一览(只读): 机器功率, 电源输入, 适配器, USB 设备
 fansctl dump          导出全部 SMC 键值(探索用)
 fansctl watch [秒]    循环刷新(默认 2 秒)
 sudo fansctl set <rpm> [N]   设定转速(不带 N = 全部风扇)
@@ -85,6 +86,21 @@ SIGTERM 优雅退出(恢复自动), 日志 `/tmp/fansctl.smart.log`
 - 与智能模式全面互斥: 任一启动会先收走另一方的控制权
 - 状态 pidfile `/tmp/fansctl.hold.pid` = "pid 目标°C", `hold stop` 等收尾;
   日志 `/tmp/fansctl.hold.log`; 唤醒让权/MODE_REASSERT 与智能模式同款
+
+## 功率查询
+
+`fansctl power` 一次汇总供电全景 (只读, 无需 root):
+
+- **机器功率** — SMC 键 `PSTR` (秒级实时, 与菜单栏第一行同源), 充电时
+  拆分系统/充电分量
+- **电源输入** — AppleSmartBattery 遥测 `SystemVoltageIn × SystemCurrentIn`,
+  即电源口实际进来的功率; 这组遥测约分钟级刷新, 短期波动以 PSTR 为准
+- **适配器** — `AdapterDetails` 额定瓦数与 PD 协商电压
+- **USB 设备** — 逐个列出声明的 5V 电流需求 (IOUSBLib 读配置描述符
+  bMaxPower, USB2 按 2mA、USB3+ 按 8mA 单位换算), 自供电设备会标注
+
+局限: macOS 不提供外设**实际**拉取功率或对外 PD 协商结果的公开接口,
+USB 侧只有设备自报的声明值 (实测需外接功率计)。
 
 ## 免密与安全模型
 

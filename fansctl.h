@@ -3,6 +3,7 @@
 #define FANSCTL_H
 
 #include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <math.h>
 #include <signal.h>
@@ -11,7 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.1.0"
+#define FANSCTL_VERSION "1.2.0"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
@@ -282,6 +283,76 @@ static inline void hold_pid_write(double t) {
 }
 
 static inline void hold_pid_clear(void) { unlink(HOLD_PIDFILE); }
+
+/* ==================== 供电遥测 (IOKit AppleSmartBattery, 只读) ==================== */
+
+/* 一次打开 AppleSmartBattery 读全: 输入遥测在嵌套字典 PowerTelemetryData,
+   适配器信息在 AdapterDetails, 电池电流在 Amperage/Voltage。
+   无电池的机器返回 -1; 缺键/未插适配器时对应字段保持 -1, 调用方按需展示。
+   注意: 这组遥测约分钟级才刷新, 比 SMC PSTR (秒级) 慢 */
+struct power_info {
+    double sys_w;    /* 实际输入功率 W (SystemPowerIn); -1 未知 */
+    double sys_v;    /* 输入电压 V (SystemVoltageIn); -1 未知 */
+    double sys_i;    /* 输入电流 A (SystemCurrentIn); -1 未知 */
+    int adapter_w;   /* 适配器额定 W; -1 未知 */
+    int adapter_v;   /* 适配器协商电压 V (AdapterVoltage mV 换算); -1 未知 */
+    int ext;         /* 1=外接电源已连接 */
+    int charging;    /* 1=电池充电中 */
+    double charge_w; /* 电池充电功率 W (Amperage>50mA 才算, 滤满电/读数噪声); 0=未充电 */
+    double batt_v;   /* 电池电压 V; -1 未知 */
+    double batt_a;   /* 电池电流 mA, 正=充电 负=放电 (未滤); 0 未知 */
+};
+
+/* CFNumber -> double, 非 CFNumber 或 NULL 返回 -1 */
+static inline double cfnum_to_double(CFNumberRef n) {
+    double d = -1;
+    if (n && CFGetTypeID(n) == CFNumberGetTypeID())
+        CFNumberGetValue(n, kCFNumberDoubleType, &d);
+    return d;
+}
+
+static inline int power_read(struct power_info *p) {
+    memset(p, 0, sizeof *p);
+    p->sys_w = p->sys_v = p->sys_i = -1;
+    p->adapter_w = p->adapter_v = -1;
+    p->batt_v = -1;
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                   IOServiceMatching("AppleSmartBattery"));
+    if (!svc) return -1;
+    CFMutableDictionaryRef props = NULL;
+    kern_return_t r = IORegistryEntryCreateCFProperties(svc, &props,
+                                                        kCFAllocatorDefault, kNilOptions);
+    IOObjectRelease(svc);
+    if (r != KERN_SUCCESS || !props) return -1;
+    CFDictionaryRef tele = CFDictionaryGetValue(props, CFSTR("PowerTelemetryData"));
+    if (tele) { /* 单位: mW / mV / mA */
+        double w = cfnum_to_double(CFDictionaryGetValue(tele, CFSTR("SystemPowerIn")));
+        double v = cfnum_to_double(CFDictionaryGetValue(tele, CFSTR("SystemVoltageIn")));
+        double i = cfnum_to_double(CFDictionaryGetValue(tele, CFSTR("SystemCurrentIn")));
+        if (w > 0) p->sys_w = w / 1000.0;
+        if (v > 0) p->sys_v = v / 1000.0;
+        if (i > 0) p->sys_i = i / 1000.0;
+    }
+    CFDictionaryRef ad = CFDictionaryGetValue(props, CFSTR("AdapterDetails"));
+    if (ad) {
+        double w = cfnum_to_double(CFDictionaryGetValue(ad, CFSTR("Watts")));
+        double v = cfnum_to_double(CFDictionaryGetValue(ad, CFSTR("AdapterVoltage")));
+        if (w > 0) p->adapter_w = (int)w;
+        if (v > 0) p->adapter_v = (int)(v / 1000.0);
+    }
+    CFTypeRef b;
+    if ((b = CFDictionaryGetValue(props, CFSTR("ExternalConnected"))) && b == kCFBooleanTrue)
+        p->ext = 1;
+    if ((b = CFDictionaryGetValue(props, CFSTR("IsCharging"))) && b == kCFBooleanTrue)
+        p->charging = 1;
+    double a = cfnum_to_double(CFDictionaryGetValue(props, CFSTR("Amperage"))); /* mA, 有符号 */
+    double v = cfnum_to_double(CFDictionaryGetValue(props, CFSTR("Voltage")));  /* mV */
+    if (a > -1) p->batt_a = a;
+    if (v > 0) p->batt_v = v / 1000.0;
+    if (a > 50 && v > 0) p->charge_w = a * v / 1e6; /* >50mA 才算充电 */
+    CFRelease(props);
+    return 0;
+}
 
 /* 菜单栏界面 (fansbar.m): 无参数启动时进入 */
 int bar_main(void);
