@@ -406,8 +406,17 @@ static int apply_cmd(int argc, char **argv) {
 }
 
 /* fansctl __smart 低 高 — root 后台运行的智能模式 (菜单栏启动), pidfile 标记状态。
-   自行 fork 守护化: 授权父进程立即退出(菜单栏的授权管道即刻关闭), 子进程脱会话继续跑 */
+   自行 fork 守护化: 授权父进程立即退出(菜单栏的授权管道即刻关闭), 子进程脱会话继续跑。
+   argv[2]=="stop" 时结束运行中的智能模式 (给 setuid 助手/菜单栏用)。 */
 static int smart_hidden_cmd(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[2], "stop") == 0) {
+        int pid; double lo, hi;
+        if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
+        if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
+        for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
+        printf("智能模式已停止(恢复自动)\n");
+        return 0;
+    }
     double t_lo = argc > 2 ? atof(argv[2]) : 40;
     double t_hi = argc > 3 ? atof(argv[3]) : 80;
     if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) return 1;
@@ -441,6 +450,13 @@ int main(int argc, char **argv) {
         sigprocmask(SIG_UNBLOCK, &un, NULL);
     }
     if (!cmd) return bar_main(); /* 菜单栏应用, bar_main 自行打开 SMC */
+    if (geteuid() == 0 && getuid() != 0) {
+        /* setuid 助手上下文 (/usr/local/bin/fansctl-root): 只放行固定风扇动作,
+           严防被用作通用提权入口 */
+        int ok = strcmp(cmd, "__apply") == 0 || strcmp(cmd, "__smart") == 0 ||
+                 (strcmp(cmd, "smart") == 0 && argc >= 3 && strcmp(argv[2], "stop") == 0);
+        if (!ok) { fprintf(stderr, "setuid 助手只允许风扇操作\n"); return 1; }
+    }
     if (strcmp(cmd, "__apply") == 0) return apply_cmd(argc, argv);
     if (strcmp(cmd, "__smart") == 0) return smart_hidden_cmd(argc, argv);
     if (strcmp(cmd, "__ask") == 0) return ask_main(argc, argv);

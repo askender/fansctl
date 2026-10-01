@@ -67,10 +67,25 @@ static int aewp_exec(const char *tool, char *const args[]) {
     return rc;
 }
 
-/* 菜单栏动作入口: 派生普通子进程 self __ask tool args... (子进程里完成授权),
-   返回其退出码 (0=成功)。stderr 继承 -> /tmp/fansctl.bar.log */
+/* 特权动作统一入口: 优先 setuid 助手 fansctl-root (免密); 未安装时回退
+   __ask 子进程授权 (每次弹密码框) */
+#define FANSCTL_ROOT "/usr/local/bin/fansctl-root"
+
 static int run_root_argv(char *const argv[]) {
-    if (!g_self[0]) return -1;
+    if (access(FANSCTL_ROOT, X_OK) == 0) {
+        /* argv[0] 是工具路径(给 __ask/AEWP 用), helper 自身即工具, 参数从 argv[1] 起 */
+        NSMutableArray *m = [NSMutableArray array];
+        for (char *const *a = argv + 1; *a; a++) [m addObject:U(*a)];
+        NSTask *t = [[NSTask alloc] init];
+        t.launchPath = @FANSCTL_ROOT;
+        t.arguments = m;
+        [t launch];
+        [t waitUntilExit];
+        int rc = (int)t.terminationStatus;
+        [t release];
+        return rc == 0 ? 0 : -1;
+    }
+    if (!argv[0] || !g_self[0]) return -1;
     NSMutableArray *m = [NSMutableArray arrayWithObject:@"__ask"];
     for (char *const *a = argv; *a; a++) [m addObject:U(*a)];
     NSTask *t = [[NSTask alloc] init];
@@ -241,12 +256,10 @@ static int thresh_idx(void) {
 - (void)doSmart:(id)sender {
     (void)sender;
     int pid; double slo, shi;
-    char pidstr[16];
     if (smart_pid_read(&pid, &slo, &shi)) {
         /* smart 的 SIGTERM 处理器会恢复自动并清 pidfile */
-        snprintf(pidstr, sizeof pidstr, "%d", pid);
-        char *argv[] = {(char *)"/bin/kill", "-TERM", pidstr, NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
+        char *argv[] = {g_self, "__smart", "stop", NULL};
+        [self flash:run_root_argv(argv) == 0 ? @"智能已关闭 ✓" : @"⚠ 执行失败"];
     } else {
         int idx = thresh_idx();
         char lo[8], hi[8];

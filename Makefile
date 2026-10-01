@@ -14,6 +14,14 @@ install: all
 
 uninstall:
 	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
+	sudo rm -f /usr/local/bin/fansctl-root
+
+# 安装 setuid root 助手: 菜单栏控制免密执行 (仅放行固定风扇动作)
+install-root: all
+	sudo rm -f /usr/local/bin/fansctl-root
+	sudo cp fansctl /usr/local/bin/fansctl-root
+	sudo chown root:wheel /usr/local/bin/fansctl-root
+	sudo chmod 4755 /usr/local/bin/fansctl-root
 
 clean:
 	rm -f fansctl
