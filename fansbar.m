@@ -266,6 +266,13 @@ static int thresh_idx(void) {
 
 - (void)flash:(NSString *)s { g_item.button.title = s; /* ≤2s 后 tick 自动刷新 */ }
 
+/* NSMenu 点任何项都会收起下拉; 动作完成后短暂延迟重新打开,
+   效果上"点了不消失", 可连续切换并看到钩子变化 */
+- (void)reopenMenu {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [g_item.button performClick:nil]; });
+}
+
 /* 点全速/自动 = 接管控制: 先停掉运行中的智能模式, 否则它每秒改回目标转速 */
 - (void)takeover:(void (^)(void))apply {
     int pid; double slo, shi;
@@ -282,6 +289,7 @@ static int thresh_idx(void) {
         char *argv[] = {g_self, "__apply", "max", NULL};
         [self flash:run_root_argv(argv) == 0 ? @"全速 ✓" : @"⚠ 执行失败"];
     }];
+    [self reopenMenu];
 }
 - (void)doAuto:(id)sender {
     (void)sender;
@@ -289,6 +297,7 @@ static int thresh_idx(void) {
         char *argv[] = {g_self, "__apply", "auto", NULL};
         [self flash:run_root_argv(argv) == 0 ? @"已恢复自动 ✓" : @"⚠ 执行失败"];
     }];
+    [self reopenMenu];
 }
 
 - (void)doSmart:(id)sender {
@@ -304,8 +313,9 @@ static int thresh_idx(void) {
         snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
         snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
         char *argv[] = {g_self, "__smart", lo, hi, NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"智能启动中…" : @"⚠ 授权失败"];
+        [self flash:run_root_argv(argv) == 0 ? @"智能启动中…" : @"⚠ 执行失败"];
     }
+    [self reopenMenu];
 }
 
 - (void)doThresh:(id)sender {
@@ -321,6 +331,7 @@ static int thresh_idx(void) {
         [self flash:run_root_argv(argv) == 0 ? @"阈值已更新 ✓" : @"⚠ 更新失败"];
     }
     [self tick];
+    [self reopenMenu];
 }
 
 @end
