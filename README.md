@@ -98,7 +98,7 @@ SIGTERM 优雅退出(恢复自动), 日志 `/tmp/fansctl.smart.log`
 - **适配器** — `AdapterDetails` 额定瓦数与 PD 协商电压
 - **USB 设备** — 逐个列出声明的 5V 电流需求 (IOUSBLib 读配置描述符
   bMaxPower, USB2 按 2mA、USB3+ 按 8mA 单位换算), 自供电设备会标注
-- **功耗 Top 进程** — 0.4 秒两次采样的当前 CPU% 降序, 附内存/占空比/PID;
+- **功耗 Top 进程** — 0.4 秒两次采样的当前 CPU% 降序, 附内存/%MEM/PID;
   macOS 限制: 非特权进程只能读本用户进程的占用 (系统进程如 WindowServer
   需 `sudo fansctl power`), 每进程 GPU 占用无公开接口
 
