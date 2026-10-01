@@ -443,6 +443,7 @@ int main(int argc, char **argv) {
     if (!cmd) return bar_main(); /* 菜单栏应用, bar_main 自行打开 SMC */
     if (strcmp(cmd, "__apply") == 0) return apply_cmd(argc, argv);
     if (strcmp(cmd, "__smart") == 0) return smart_hidden_cmd(argc, argv);
+    if (strcmp(cmd, "__ask") == 0) return ask_main(argc, argv);
     g_debug = getenv("FANSCTL_DEBUG") != NULL;
     if (smc_open() != 0) return 1;
     int rc = 0;

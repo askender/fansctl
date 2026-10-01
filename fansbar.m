@@ -14,7 +14,6 @@
 #import <mach-o/dyld.h>
 #import <Security/Security.h>
 #include <limits.h>
-#include <sys/wait.h>
 #include "fansctl.h"
 
 static NSStatusItem *g_item;
@@ -31,11 +30,10 @@ static char g_self[PATH_MAX];
 static NSString *U(const char *s) { return [NSString stringWithUTF8String:s ? s : "?"]; }
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-/* 以 root 直接 exec argv[0] (argv 以 NULL 结尾) — 无 shell 无引号无 osascript。
-   密码框由 SecurityAgent 弹出。返回 0=成功(含用户授权且已启动), -1=取消/失败。
-   注: 不能走 do shell script with administrator privileges — 该路径在无 TTY 的
-   后台进程里会把整条命令串当成单个文件名执行 (ENOENT 127)。 */
-static int run_root_argv(char *const argv[], BOOL wait_finish) {
+/* 授权+AEWP 核心。必须在普通子进程里跑 (fansctl __ask): 直接在 fork+setsid 的
+   会话首进程里调用 AuthorizationCopyRights 会永远阻塞且不弹密码框。成功返回 0,
+   子工具有报错输出时转写到自身 stderr 并返回 -1。 */
+static int aewp_exec(const char *tool, char *const args[]) {
     AuthorizationRef auth = NULL;
     if (AuthorizationCreate(NULL, kAuthorizationEmptyEnvironment,
                             kAuthorizationFlagDefaults, &auth) != errAuthorizationSuccess)
@@ -45,33 +43,44 @@ static int run_root_argv(char *const argv[], BOOL wait_finish) {
     OSStatus st = AuthorizationCopyRights(auth, &rights, NULL,
             kAuthorizationFlagInteractionAllowed | kAuthorizationFlagExtendRights, NULL);
     if (st != errAuthorizationSuccess) {
+        fprintf(stderr, "CopyRights 失败: %d\n", (int)st);
         AuthorizationFree(auth, kAuthorizationFlagDefaults);
         return -1;
     }
     FILE *pipe = NULL;
-    st = AuthorizationExecuteWithPrivileges(auth, argv[0], kAuthorizationFlagDefaults,
-                                            (char *const *)&argv[1], &pipe);
+    st = AuthorizationExecuteWithPrivileges(auth, tool, kAuthorizationFlagDefaults,
+                                            (char *const *)args, &pipe);
     AuthorizationFree(auth, kAuthorizationFlagDefaults);
-    if (st != errAuthorizationSuccess) return -1;
-    if (pipe) {
-        if (wait_finish) {
-            /* 子进程成功时静默; 有报错输出则记日志并视为失败 (按钮显示 ⚠) */
-            char buf[1024]; size_t got = 0, n;
-            while (got < sizeof buf - 1 && (n = fread(buf + got, 1, sizeof buf - 1 - got, pipe)) > 0)
-                got += n;
-            buf[got] = 0;
-            fclose(pipe);
-            if (got > 0) {
-                FILE *lg = fopen("/tmp/fansctl.bar.log", "a");
-                if (lg) { fprintf(lg, "%s", buf); fclose(lg); }
-                return -1;
-            }
-        } else {
-            fclose(pipe);
-        }
+    if (st != errAuthorizationSuccess) {
+        fprintf(stderr, "ExecuteWithPrivileges 失败: %d\n", (int)st);
+        return -1;
     }
-    /* AEWP 子进程是我们直接子进程, tick 里收割僵尸 */
-    return 0;
+    int rc = 0;
+    if (pipe) {
+        char buf[1024]; size_t got = 0, n;
+        while (got < sizeof buf - 1 && (n = fread(buf + got, 1, sizeof buf - 1 - got, pipe)) > 0)
+            got += n;
+        buf[got] = 0;
+        fclose(pipe);
+        if (got > 0) { fputs(buf, stderr); rc = -1; }
+    }
+    return rc;
+}
+
+/* 菜单栏动作入口: 派生普通子进程 self __ask tool args... (子进程里完成授权),
+   返回其退出码 (0=成功)。stderr 继承 -> /tmp/fansctl.bar.log */
+static int run_root_argv(char *const argv[]) {
+    if (!g_self[0]) return -1;
+    NSMutableArray *m = [NSMutableArray arrayWithObject:@"__ask"];
+    for (char *const *a = argv; *a; a++) [m addObject:U(*a)];
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @(g_self);
+    t.arguments = m;
+    [t launch];
+    [t waitUntilExit];
+    int rc = (int)t.terminationStatus;
+    [t release];
+    return rc == 0 ? 0 : -1;
 }
 
 static int thresh_idx(void) {
@@ -92,7 +101,6 @@ static int thresh_idx(void) {
 @implementation BarDelegate
 
 - (void)tick {
-    while (waitpid(-1, NULL, WNOHANG) > 0) {} /* 收割 run_root_argv 的僵尸 */
     int pid = 0; double slo = 0, shi = 0;
     int smart = smart_pid_read(&pid, &slo, &shi);
 
@@ -222,12 +230,12 @@ static int thresh_idx(void) {
 - (void)doMax:(id)sender {
     (void)sender;
     char *argv[] = {g_self, "__apply", "max", NULL};
-    [self flash:run_root_argv(argv, YES) == 0 ? @"全速 ✓" : @"⚠ 授权失败"];
+    [self flash:run_root_argv(argv) == 0 ? @"全速 ✓" : @"⚠ 授权失败"];
 }
 - (void)doAuto:(id)sender {
     (void)sender;
     char *argv[] = {g_self, "__apply", "auto", NULL};
-    [self flash:run_root_argv(argv, YES) == 0 ? @"恢复自动 ✓" : @"⚠ 授权失败"];
+    [self flash:run_root_argv(argv) == 0 ? @"恢复自动 ✓" : @"⚠ 授权失败"];
 }
 
 - (void)doSmart:(id)sender {
@@ -238,14 +246,14 @@ static int thresh_idx(void) {
         /* smart 的 SIGTERM 处理器会恢复自动并清 pidfile */
         snprintf(pidstr, sizeof pidstr, "%d", pid);
         char *argv[] = {(char *)"/bin/kill", "-TERM", pidstr, NULL};
-        [self flash:run_root_argv(argv, YES) == 0 ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
+        [self flash:run_root_argv(argv) == 0 ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
     } else {
         int idx = thresh_idx();
         char lo[8], hi[8];
         snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
         snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
         char *argv[] = {g_self, "__smart", lo, hi, NULL};
-        [self flash:run_root_argv(argv, NO) == 0 ? @"智能启动中…" : @"⚠ 授权失败"];
+        [self flash:run_root_argv(argv) == 0 ? @"智能启动中…" : @"⚠ 授权失败"];
     }
 }
 
@@ -259,6 +267,12 @@ static int thresh_idx(void) {
 @end
 
 static BarDelegate *g_bar_delegate; /* 无 ARC, 用全局变量持有 */
+
+/* fansctl __ask <tool> [args...]: 在普通子进程上下文里完成授权并以 root 执行 tool */
+int ask_main(int argc, char **argv) {
+    if (argc < 3) return 1;
+    return aewp_exec(argv[2], &argv[3]);
+}
 
 /* fansctl 无参数入口: fork 进后台, 不占用终端 */
 int bar_main(void) {

@@ -227,5 +227,7 @@ static inline void smart_pid_clear(void) { unlink(SMART_PIDFILE); }
 
 /* 菜单栏界面 (fansbar.m): 无参数启动时进入 */
 int bar_main(void);
+/* 授权执行 (fansbar.m): fansctl __ask <tool> [args...] */
+int ask_main(int argc, char **argv);
 
 #endif /* FANSCTL_H */
