@@ -37,6 +37,29 @@ static char g_self[PATH_MAX];
 
 static NSString *U(const char *s) { return [NSString stringWithUTF8String:s ? s : "?"]; }
 
+/* 电池充电功率 W (IOKit 直读 AppleSmartBattery, 无子进程)。PSTR 是适配器
+   输入功率, 含充电分量——那部分能量存进电池而非机器消耗, 显示时扣除
+   (口径借自 fanctl; Amperage>50mA 才算充电, 滤放电/满电噪声) */
+static double read_charge_watts(void) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                   IOServiceMatching("AppleSmartBattery"));
+    if (!svc) return 0;
+    CFMutableDictionaryRef props = NULL;
+    kern_return_t r = IORegistryEntryCreateCFProperties(svc, &props,
+                                                        kCFAllocatorDefault, kNilOptions);
+    IOObjectRelease(svc);
+    if (r != KERN_SUCCESS || !props) return 0;
+    double w = 0;
+    CFNumberRef amp = CFDictionaryGetValue(props, CFSTR("Amperage"));
+    CFNumberRef mv = CFDictionaryGetValue(props, CFSTR("Voltage"));
+    SInt32 a = 0, v = 0;
+    if (amp && CFNumberGetValue(amp, kCFNumberSInt32Type, &a) &&
+        mv && CFNumberGetValue(mv, kCFNumberSInt32Type, &v) && a > 50 && v > 0)
+        w = (double)a * v / 1e6;
+    CFRelease(props);
+    return w;
+}
+
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 /* 授权+AEWP 核心。必须在普通子进程里跑 (fansctl __ask): 直接在 fork+setsid 的
    会话首进程里调用 AuthorizationCopyRights 会永远阻塞且不弹密码框。成功返回 0,
@@ -136,27 +159,37 @@ static int hold_idx(void) {
     }
     const char *tkey = NULL;
     double T = hottest_temp(&tkey);
-    char tb[8] = "--", fb[8] = "--", buf[48];
+    char tb[8] = "--", fb[8] = "--", buf[64];
     if (T > -999) snprintf(tb, sizeof tb, "%.0f", T);
     if (mx_ac >= 0) snprintf(fb, sizeof fb, "%.0f", mx_ac / 1000.0);
     snprintf(buf, sizeof buf, "%s|%s", tb, fb);
     g_item.button.title = U(buf);
 
-    /* 状态区第 0 行: 最热传感器 + 曲线百分比或恒温目标 */
+    /* 状态区第 0 行: 最热传感器/曲线或恒温目标 + 整机功率。
+       PSTR = 系统输入功率 W (与 ioreg SystemPowerIn 同源), 无此键的机器不显示 */
+    double pw = -1;
+    read_key_value("PSTR", NULL, &pw, NULL);
+    int off = 0;
     if (T > -999) {
         if (smart) {
             double frac = (T - slo) / (shi - slo);
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
-            snprintf(buf, sizeof buf, "%s %.1f°C  曲线%.0f%%", tkey, T, frac * 100);
+            off = snprintf(buf, sizeof buf, "%s %.1f°C  曲线%.0f%%", tkey, T, frac * 100);
         } else if (hold) {
-            snprintf(buf, sizeof buf, "%s %.1f°C  目标%.0f°C", tkey, T, ht);
+            off = snprintf(buf, sizeof buf, "%s %.1f°C  目标%.0f°C", tkey, T, ht);
         } else {
-            snprintf(buf, sizeof buf, "%s %.1f°C", tkey, T);
+            off = snprintf(buf, sizeof buf, "%s %.1f°C", tkey, T);
         }
     } else {
-        snprintf(buf, sizeof buf, "温度读取失败");
+        off = snprintf(buf, sizeof buf, "温度读取失败");
     }
+    if (pw > 0 && pw < 1000) {
+        pw -= read_charge_watts(); /* 扣除充电分量: 入电池, 非机器消耗 */
+        if (pw < 0) pw = 0;
+    }
+    if (pw > 0 && off > 0 && (size_t)off < sizeof buf - 8)
+        snprintf(buf + off, sizeof buf - (size_t)off, "  %.0fW", pw);
     if ([g_infoItems count] > 0)
         [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
 

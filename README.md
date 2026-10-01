@@ -1,6 +1,6 @@
 # fansctl
 
-macOS SMC 风扇/温度工具, Mac Studio M1 Max (Apple Silicon) 实测。
+macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
 版本: `fansctl version` (当前 1.1.0)。
@@ -39,6 +39,9 @@ sudo fansctl hold stop       结束恒温模式(含菜单栏启动的)
 ## 菜单栏
 
 - 状态栏标题: `最热°C|最大转速(krpm)`, 2 秒刷新
+- 下拉第一行: 最热传感器/曲线%或恒温目标 + 机器功率 (SMC 键 `PSTR`,
+  与 ioreg SystemPowerIn 同源; 充电时扣除 Amperage×Voltage 充电分量,
+  放电/无电池机器显示 PSTR 原值; 无此键的机器自动隐藏功率)
 - **全速 / 自动 / 智能模式 / 恒温模式** 四态互斥打钩; 点任意控制项先接管
   (停掉运行中的智能/恒温)再应用
 - **智能阈值** 四档子菜单: 60~95(默认) / 55~95 / 45~85 / 40~80, 存 NSUserDefaults,
@@ -108,7 +111,7 @@ LaunchDaemon `/Library/LaunchDaemons/local.fansctl.restore.plist`,
 每次开机以 root 执行 `fansctl-root __apply auto` 一次——崩溃/断电后
 SMC 若残留手动模式, 开机即恢复自动, 风扇不会卡死在最后转速。
 
-## 本机 SMC 事实 (Mac Studio M1 Max, macOS 15)
+## 本机 SMC 事实 (MacBook Pro 16" M1 Max, macOS 15)
 
 - SMCKeyData 必须 80 字节(Apple Silicon), selector 2
 - FNum=2; Mn=1200, Mx=5779/6241; 模式键 F0md/F1md (ui8, 1=手动),
