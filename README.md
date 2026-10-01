@@ -3,6 +3,7 @@
 macOS SMC 风扇/温度工具, Mac Studio M1 Max (Apple Silicon) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
+版本: `fansctl version` (当前 1.0.0)。
 
 ## 构建与安装
 
@@ -64,6 +65,7 @@ AuthorizationExecuteWithPrivileges(每次弹密码框)。
 `~/Library/LaunchAgents/local.fansctl.bar.plist` (仓库有副本):
 
 ```sh
+# 先把 plist 里的 /Users/USERNAME 改成本机用户名
 cp local.fansctl.bar.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.fansctl.bar.plist
 ```
@@ -77,3 +79,10 @@ RunAtLoad + 崩溃自动拉起(SuccessfulExit=false), 菜单点"退出"不复活
   目标键 F0Tg/F1Tg ('flt ' f32 小端)
 - 无 Ftst、无 FS! 键, 不需要解锁流程
 - Apple Silicon 低温时风扇可完全停转, Ac/Tg=0 是真实状态
+
+## 许可证
+
+AGPL-3.0-or-later (见 [LICENSE](LICENSE))。任何人可自由使用/修改/分发,
+但基于本项目的产品(含仅部署为网络服务、不分发二进制的形态)必须以
+AGPL-3.0 开源其衍生代码。**商用允许, 闭源商用违反许可证**;
+若用于商业产品, 欢迎告知作者。

@@ -11,6 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define FANSCTL_VERSION "1.0.0"
+
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
 #define SMC_CMD_WRITE_BYTES  6

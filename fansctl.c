@@ -4,6 +4,7 @@
  * SMC 读取核心在 fansctl.h, 菜单栏界面在 fansbar.m
  * 完整子命令列表见 main() 的用法输出 (fans/status/temps/dump/watch 只读;
  * set/max/auto/smart 需 root)
+ * 许可证: AGPL-3.0-or-later (见 LICENSE), 商用需开源衍生代码
  */
 #include "fansctl.h"
 
@@ -444,6 +445,10 @@ static int smart_hidden_cmd(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : NULL;
+    if (cmd && (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)) {
+        printf("fansctl %s\n", FANSCTL_VERSION);
+        return 0;
+    }
     /* osascript 提权链会把 SIGINT/SIGTERM/SIGHUP 阻塞并跨 exec 继承,
        导致 smart 的优雅退出和 Ctrl+C 全部失效, 在此解除 */
     {
@@ -565,7 +570,8 @@ int main(int argc, char **argv) {
             "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
             "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
             "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
-            "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n");
+            "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
+            "  version         版本号\n");
         smc_close();
         return 1;
     }

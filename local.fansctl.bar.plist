@@ -6,7 +6,7 @@
 	<string>local.fansctl.bar</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/askender/.local/bin/fansctl</string>
+		<string>/Users/USERNAME/.local/bin/fansctl</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
