@@ -256,11 +256,12 @@ static int thresh_idx(void) {
     [it release];
     g_item.menu = menu;
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:2.0
-                                                  target:self
-                                                selector:@selector(tick)
-                                                userInfo:nil
-                                                 repeats:YES];
+    /* 菜单展开时主线程处于 NSEventTrackingRunLoopMode, 默认模式的 NSTimer 不触发,
+       打钩会"冻结"。挂到公共模式, 菜单开着也持续 2 秒刷新 */
+    NSTimer *t = [NSTimer timerWithTimeInterval:2.0 target:self selector:@selector(tick)
+                                      userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+    self.timer = t;
     [self tick];
 }
 
@@ -287,7 +288,9 @@ static int thresh_idx(void) {
     (void)sender;
     [self takeover:^{
         char *argv[] = {g_self, "__apply", "max", NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"全速 ✓" : @"⚠ 执行失败"];
+        int ok = run_root_argv(argv) == 0;
+        [self tick]; /* 立即刷新打钩, 重开的菜单直接显示新状态 */
+        [self flash:ok ? @"全速 ✓" : @"⚠ 执行失败"];
     }];
     [self reopenMenu];
 }
@@ -295,7 +298,9 @@ static int thresh_idx(void) {
     (void)sender;
     [self takeover:^{
         char *argv[] = {g_self, "__apply", "auto", NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"已恢复自动 ✓" : @"⚠ 执行失败"];
+        int ok = run_root_argv(argv) == 0;
+        [self tick];
+        [self flash:ok ? @"已恢复自动 ✓" : @"⚠ 执行失败"];
     }];
     [self reopenMenu];
 }
@@ -306,14 +311,18 @@ static int thresh_idx(void) {
     if (smart_pid_read(&pid, &slo, &shi)) {
         /* smart 的 SIGTERM 处理器会恢复自动并清 pidfile */
         char *argv[] = {g_self, "__smart", "stop", NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"智能已关闭 ✓" : @"⚠ 执行失败"];
+        int ok = run_root_argv(argv) == 0;
+        [self tick];
+        [self flash:ok ? @"智能已关闭 ✓" : @"⚠ 执行失败"];
     } else {
         int idx = thresh_idx();
         char lo[8], hi[8];
         snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
         snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
         char *argv[] = {g_self, "__smart", lo, hi, NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"智能启动中…" : @"⚠ 执行失败"];
+        int ok = run_root_argv(argv) == 0;
+        [self tick];
+        [self flash:ok ? @"智能启动中…" : @"⚠ 执行失败"];
     }
     [self reopenMenu];
 }
@@ -322,15 +331,17 @@ static int thresh_idx(void) {
     int idx = (int)[sender tag];
     [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:@"SmartThreshIdx"];
     int pid; double slo, shi;
+    NSString *msg = nil;
     if (smart_pid_read(&pid, &slo, &shi)) {
         /* 运行中: 热更新守护进程阈值, 不打断风扇控制 */
         char lo[8], hi[8];
         snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
         snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
         char *argv[] = {g_self, "__smart", "thresh", lo, hi, NULL};
-        [self flash:run_root_argv(argv) == 0 ? @"阈值已更新 ✓" : @"⚠ 更新失败"];
+        msg = run_root_argv(argv) == 0 ? @"阈值已更新 ✓" : @"⚠ 更新失败";
     }
     [self tick];
+    if (msg) [self flash:msg];
     [self reopenMenu];
 }
 
