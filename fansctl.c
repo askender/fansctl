@@ -67,18 +67,7 @@ static int find_md_key(int idx, char out[5]) {
     return 0;
 }
 
-/* 0=自动 1=手动 -1=未知 */
-static int read_mode(int idx) {
-    char md[5];
-    double v = 0; UInt32 t; char hex[80];
-    if (find_md_key(idx, md)) {
-        if (read_key_value(md, &t, &v, hex) != 0) return -1;
-        return (int)v == 1 ? 1 : 0;
-    }
-    if (read_key_value("FS! ", &t, &v, hex) == 0)
-        return (((int)v) >> idx) & 1;
-    return -1;
-}
+/* 0=自动 1=手动 -1=未知 (fan_mode 在 fansctl.h) */
 
 /* 返回 kern_return_t: KERN_SUCCESS=成功 */
 static kern_return_t write_mode_bit(int idx, int manual) {
@@ -101,7 +90,7 @@ static kern_return_t write_mode_bit(int idx, int manual) {
 static int ftst_held = 0;
 
 static int engage_manual(int idx) {
-    if (read_mode(idx) == 1) return 0;
+    if (fan_mode(idx) == 1) return 0;
     kern_return_t r = write_mode_bit(idx, 1);
     if (r == KERN_SUCCESS) return 0;
     if (r == KR_NOT_PRIVILEGED) {
@@ -213,7 +202,7 @@ static void print_status(void) {
         read_rpm_key(i, "Tg", &tg);
         read_rpm_key(i, "Mn", &mn);
         read_rpm_key(i, "Mx", &mx);
-        int mode = read_mode(i);
+        int mode = fan_mode(i);
         printf("风扇%d  当前 %7.0f  目标 %7.0f  [%.0f~%.0f]  模式 %s\n",
                i, ac, tg, mn, mx, mode == 1 ? "手动" : mode == 0 ? "自动" : "未知");
     }

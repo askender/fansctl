@@ -132,6 +132,36 @@ static inline int read_rpm_key(int idx, const char *suffix, double *out) {
     return -1;
 }
 
+/* F?md / F?Md 探测; 找到返回1并填键名 */
+static inline int fan_md_key(int idx, char out[5]) {
+    char a[5], b[5];
+    snprintf(a, sizeof(a), "F%dmd", idx);
+    snprintf(b, sizeof(b), "F%dMd", idx);
+    SMCKeyData in = {0}, o = {0};
+    in.key = str_to_key(a);
+    in.data8 = SMC_CMD_READ_KEYINFO;
+    if (smc_call(&in, &o) == KERN_SUCCESS && o.result == 0) { snprintf(out, 5, "%s", a); return 1; }
+    memset(&in, 0, sizeof(in)); memset(&o, 0, sizeof(o));
+    in.key = str_to_key(b);
+    in.data8 = SMC_CMD_READ_KEYINFO;
+    if (smc_call(&in, &o) == KERN_SUCCESS && o.result == 0) { snprintf(out, 5, "%s", b); return 1; }
+    out[0] = 0;
+    return 0;
+}
+
+/* 风扇模式: 0=自动 1=手动 -1=未知 */
+static inline int fan_mode(int idx) {
+    char md[5];
+    double v = 0; UInt32 t; char hex[80];
+    if (fan_md_key(idx, md)) {
+        if (read_key_value(md, &t, &v, hex) != 0) return -1;
+        return (int)v == 1 ? 1 : 0;
+    }
+    if (read_key_value("FS! ", &t, &v, hex) == 0)
+        return (((int)v) >> idx) & 1;
+    return -1;
+}
+
 /* 温度键缓存: 首次枚举全部键, 之后只重读这些 */
 static char (*g_tkeys)[5];
 static int g_tkey_n;

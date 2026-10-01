@@ -19,7 +19,7 @@
 static NSStatusItem *g_item;
 static NSMutableArray *g_infoItems;   /* 状态区: 第 0 行温度, 之后每风扇一行 */
 static NSMenuItem *g_smartItem;
-static NSMenuItem *g_threshItem;
+static NSMenuItem *g_threshRoot;      /* "智能阈值" 父项, 子菜单为四档预设 */
 static int g_fan_n = 1;
 
 static const double kThresh[][2] = {{60, 95}, {55, 95}, {45, 85}, {40, 80}};
@@ -150,29 +150,33 @@ static int thresh_idx(void) {
     if ([g_infoItems count] > 0)
         [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
 
-    /* 每风扇一行: 当前 (目标) */
+    /* 每风扇一行: 当前 (目标) 模式 */
     for (int f = 0; f < g_fan_n && (NSInteger)(f + 1) < [g_infoItems count]; f++) {
         double ac = -1, tg = -1;
         read_rpm_key(f, "Ac", &ac);
         read_rpm_key(f, "Tg", &tg);
-        if (tg < 0) snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm", f, ac);
-        else        snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm (目标 %.0f)", f, ac, tg);
+        int mode = fan_mode(f);
+        const char *ms = mode == 1 ? "手动" : mode == 0 ? "自动" : "未知";
+        if (tg < 0) snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm  %s", f, ac, ms);
+        else        snprintf(buf, sizeof buf, "风扇%d  %6.0f rpm (目标 %.0f)  %s", f, ac, tg, ms);
         [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
     }
 
-    /* 智能模式菜单项 */
+    /* 智能模式: 运行中打钩并显示当前阈值 */
     if (smart) {
-        g_smartItem.title = [NSString stringWithFormat:@"智能模式 (%.0f~%.0f°C) 运行中 — 点击关闭", slo, shi];
+        g_smartItem.title = [NSString stringWithFormat:@"智能模式 (%.0f~%.0f°C)", slo, shi];
         g_smartItem.state = NSControlStateValueOn;
-        g_threshItem.enabled = NO;
+        g_threshRoot.enabled = NO;
     } else {
-        g_smartItem.title = @"智能模式 — 点击开启";
+        g_smartItem.title = @"智能模式";
         g_smartItem.state = NSControlStateValueOff;
-        g_threshItem.enabled = YES;
+        g_threshRoot.enabled = YES;
     }
+    /* 阈值子菜单: 当前档打钩 */
     int idx = thresh_idx();
-    g_threshItem.title = [NSString stringWithFormat:
-        @"智能阈值: %.0f~%.0f°C (点击切换)", kThresh[idx][0], kThresh[idx][1]];
+    NSMenu *sub = g_threshRoot.submenu;
+    for (NSInteger i = 0; i < [sub numberOfItems]; i++)
+        [sub itemAtIndex:i].state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
@@ -218,13 +222,23 @@ static int thresh_idx(void) {
     [it release];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    g_smartItem = [[NSMenuItem alloc] initWithTitle:@"智能模式 — 点击开启"
+    g_smartItem = [[NSMenuItem alloc] initWithTitle:@"智能模式"
                                              action:@selector(doSmart:) keyEquivalent:@""];
     [g_smartItem setTarget:self];
     [menu addItem:g_smartItem];
-    g_threshItem = [[NSMenuItem alloc] initWithTitle:@"智能阈值" action:@selector(doThresh:) keyEquivalent:@""];
-    [g_threshItem setTarget:self];
-    [menu addItem:g_threshItem];
+    g_threshRoot = [[NSMenuItem alloc] initWithTitle:@"智能阈值" action:nil keyEquivalent:@""];
+    NSMenu *sub = [[NSMenu alloc] init];
+    for (int i = 0; i < KTHRESH_N; i++) {
+        NSMenuItem *it = [[NSMenuItem alloc]
+            initWithTitle:[NSString stringWithFormat:@"%.0f~%.0f°C", kThresh[i][0], kThresh[i][1]]
+                    action:@selector(doThresh:) keyEquivalent:@""];
+        [it setTarget:self];
+        [it setTag:i];
+        [sub addItem:it];
+        [it release];
+    }
+    [g_threshRoot setSubmenu:sub];
+    [menu addItem:g_threshRoot];
     [menu addItem:[NSMenuItem separatorItem]];
 
     it = [[NSMenuItem alloc] initWithTitle:@"退出 fansctl" action:@selector(terminate:) keyEquivalent:@"q"];
@@ -271,9 +285,7 @@ static int thresh_idx(void) {
 }
 
 - (void)doThresh:(id)sender {
-    (void)sender;
-    int idx = (thresh_idx() + 1) % KTHRESH_N;
-    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:@"SmartThreshIdx"];
+    [[NSUserDefaults standardUserDefaults] setInteger:[sender tag] forKey:@"SmartThreshIdx"];
     [self tick];
 }
 
