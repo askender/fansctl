@@ -3,10 +3,11 @@
  *
  * 菜单:
  *   [状态区] 最热传感器/温度/曲线百分比 + 每个风扇的转速/目标 (2 秒刷新, 只读免 root)
- *   全速 / 恢复自动        -> 授权弹窗后以 root 重新执行自身: fansctl __apply max|auto
- *   智能模式 开/关          -> root 后台运行 fansctl __smart 低 高 (pidfile 记录状态)
- *   智能阈值 切换           -> 预设循环, 存 NSUserDefaults
+ *   全速 / 自动 / 智能模式 -> 三态互斥打钩; 点全速/自动先接管(停掉智能)再应用
+ *   智能阈值 -> 四档预设子菜单(存 NSUserDefaults), 智能运行中可热更新
  *   退出 (⌘Q)
+ * 特权动作走 run_root_argv: 优先 setuid 助手 fansctl-root(免密), 未安装时
+ * 回退 __ask 子进程授权弹窗。动作完成后自动重开下拉, 菜单开着也持续刷新。
  *
  * 从终端直接运行 fansctl 时 fork 进后台并 setsid, 不占用 iTerm2。
  */
@@ -25,7 +26,7 @@ static NSMenuItem *g_threshRoot;      /* "智能阈值" 父项, 子菜单为四�
 static int g_fan_n = 1;
 
 static const double kThresh[][2] = {{60, 95}, {55, 95}, {45, 85}, {40, 80}};
-#define KTHRESH_N 4
+#define KTHRESH_N ((int)(sizeof kThresh / sizeof kThresh[0]))
 
 static char g_self[PATH_MAX];
 
@@ -74,24 +75,14 @@ static int aewp_exec(const char *tool, char *const args[]) {
 #define FANSCTL_ROOT "/usr/local/bin/fansctl-root"
 
 static int run_root_argv(char *const argv[]) {
-    if (access(FANSCTL_ROOT, X_OK) == 0) {
-        /* argv[0] 是工具路径(给 __ask/AEWP 用), helper 自身即工具, 参数从 argv[1] 起 */
-        NSMutableArray *m = [NSMutableArray array];
-        for (char *const *a = argv + 1; *a; a++) [m addObject:U(*a)];
-        NSTask *t = [[NSTask alloc] init];
-        t.launchPath = @FANSCTL_ROOT;
-        t.arguments = m;
-        [t launch];
-        [t waitUntilExit];
-        int rc = (int)t.terminationStatus;
-        [t release];
-        return rc == 0 ? 0 : -1;
-    }
-    if (!argv[0] || !g_self[0]) return -1;
-    NSMutableArray *m = [NSMutableArray arrayWithObject:@"__ask"];
-    for (char *const *a = argv; *a; a++) [m addObject:U(*a)];
+    /* argv[0] 是工具路径(给 __ask/AEWP 用); setuid 助手自身即工具, 参数从 argv+1 起 */
+    int helper = access(FANSCTL_ROOT, X_OK) == 0;
+    if (!helper && (!argv[0] || !g_self[0])) return -1;
+    NSMutableArray *m = [NSMutableArray array];
+    if (!helper) [m addObject:@"__ask"];
+    for (char *const *a = argv + (helper ? 1 : 0); *a; a++) [m addObject:U(*a)];
     NSTask *t = [[NSTask alloc] init];
-    t.launchPath = @(g_self);
+    t.launchPath = helper ? @FANSCTL_ROOT : @(g_self);
     t.arguments = m;
     [t launch];
     [t waitUntilExit];
@@ -129,11 +120,10 @@ static int thresh_idx(void) {
     }
     const char *tkey = NULL;
     double T = hottest_temp(&tkey);
-    char buf[48];
-    if (T < -999 && mx_ac < 0) snprintf(buf, sizeof buf, "--|--");
-    else if (T < -999)         snprintf(buf, sizeof buf, "--|%.0f", mx_ac / 1000.0);
-    else if (mx_ac < 0)        snprintf(buf, sizeof buf, "%.0f|--", T);
-    else                       snprintf(buf, sizeof buf, "%.0f|%.0f", T, mx_ac / 1000.0);
+    char tb[8] = "--", fb[8] = "--", buf[48];
+    if (T > -999) snprintf(tb, sizeof tb, "%.0f", T);
+    if (mx_ac >= 0) snprintf(fb, sizeof fb, "%.0f", mx_ac / 1000.0);
+    snprintf(buf, sizeof buf, "%s|%s", tb, fb);
     g_item.button.title = U(buf);
 
     /* 状态区第 0 行: 最热传感器 + 曲线百分比 */

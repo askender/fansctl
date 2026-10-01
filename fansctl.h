@@ -66,7 +66,8 @@ static inline kern_return_t smc_call(SMCKeyData *in, SMCKeyData *out) {
     return IOConnectCallStructMethod(g_conn, KERNEL_INDEX_SMC, in, sizeof(SMCKeyData), out, &sz);
 }
 
-static inline kern_return_t smc_read_key(const char *keyname, UInt8 *buf, size_t *len) {
+/* 读键: 先 KEYINFO 拿长度/类型, 再 READ_BYTES 取数据。type_out 可为 NULL */
+static inline kern_return_t smc_read_key(const char *keyname, UInt8 *buf, size_t *len, UInt32 *type_out) {
     SMCKeyData in = {0}, out = {0};
     in.key = str_to_key(keyname);
     in.data8 = SMC_CMD_READ_KEYINFO;
@@ -75,6 +76,7 @@ static inline kern_return_t smc_read_key(const char *keyname, UInt8 *buf, size_t
     if (r != KERN_SUCCESS) return r;
     if (out.result != 0) return kIOReturnNotFound;
     *len = out.keyInfo.dataSize;
+    if (type_out) *type_out = out.keyInfo.dataType;
     in.keyInfo.dataSize = out.keyInfo.dataSize;
     in.keyInfo.dataType = out.keyInfo.dataType;
     in.data8 = SMC_CMD_READ_BYTES;
@@ -89,23 +91,20 @@ static inline void type_str(UInt32 t, char out[5]) {
     out[2] = (t >> 8) & 0xff;  out[3] = t & 0xff; out[4] = 0;
 }
 
-/* 返回: 0=成功解码并填入 value; 1=类型不支持(rawhex 为原始 hex); -1=读取失败 */
+/* 返回: 0=成功解码并填入 value; 1=类型不支持(rawhex 为原始 hex); -1=读取失败。
+   type_out / rawhex 可为 NULL (rawhex 容量 80, 写入按剩余空间封顶, 超长截断) */
 static inline int read_key_value(const char *keyname, UInt32 *type_out, double *value, char rawhex[80]) {
     UInt8 buf[32]; size_t len = sizeof(buf);
-    kern_return_t r = smc_read_key(keyname, buf, &len);
-    if (r != KERN_SUCCESS) {
-        if (r == kIOReturnNotFound) return -1;
-        return -1;
-    }
-    SMCKeyData in = {0}, out = {0};
-    in.key = str_to_key(keyname);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    smc_call(&in, &out);
-    UInt32 type = out.keyInfo.dataType;
+    UInt32 type = 0;
+    if (smc_read_key(keyname, buf, &len, &type) != KERN_SUCCESS) return -1;
     if (type_out) *type_out = type;
+    if (rawhex) {
+        size_t o = 0;
+        rawhex[0] = 0;
+        for (size_t i = 0; i < len && o + 4 <= 80; i++)
+            o += (size_t)snprintf(rawhex + o, 80 - o, "%02x ", buf[i]);
+    }
     char t[5]; type_str(type, t);
-    rawhex[0] = 0;
-    for (size_t i = 0; i < len; i++) snprintf(rawhex + strlen(rawhex), 8, "%02x ", buf[i]);
 
     if (strcmp(t, "fpe2") == 0 && len >= 2) { *value = (double)((buf[0] << 8) | buf[1]) / 4.0; return 0; }
     if (strcmp(t, "ui8 ") == 0 && len >= 1) { *value = buf[0]; return 0; }
@@ -119,17 +118,23 @@ static inline int read_key_value(const char *keyname, UInt32 *type_out, double *
 static inline int plausible_temp(double v) { return v > -5 && v < 130; }
 
 static inline int fan_count(void) {
-    double v = 0; UInt32 t; char hex[80];
-    if (read_key_value("FNum", &t, &v, hex) == 0 && v > 0 && v < 10) return (int)v;
+    double v = 0;
+    if (read_key_value("FNum", NULL, &v, NULL) == 0 && v > 0 && v < 10) return (int)v;
     return 0;
 }
 
 static inline int read_rpm_key(int idx, const char *suffix, double *out) {
     char k[5];
     snprintf(k, sizeof(k), "F%d%s", idx, suffix);
-    UInt32 t; char hex[80];
-    if (read_key_value(k, &t, out, hex) == 0 && *out >= 0) return 0;
+    if (read_key_value(k, NULL, out, NULL) == 0 && *out >= 0) return 0;
     return -1;
+}
+
+static inline int key_exists(const char *k) {
+    SMCKeyData in = {0}, out = {0};
+    in.key = str_to_key(k);
+    in.data8 = SMC_CMD_READ_KEYINFO;
+    return smc_call(&in, &out) == KERN_SUCCESS && out.result == 0;
 }
 
 /* F?md / F?Md 探测; 找到返回1并填键名 */
@@ -137,14 +142,8 @@ static inline int fan_md_key(int idx, char out[5]) {
     char a[5], b[5];
     snprintf(a, sizeof(a), "F%dmd", idx);
     snprintf(b, sizeof(b), "F%dMd", idx);
-    SMCKeyData in = {0}, o = {0};
-    in.key = str_to_key(a);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    if (smc_call(&in, &o) == KERN_SUCCESS && o.result == 0) { snprintf(out, 5, "%s", a); return 1; }
-    memset(&in, 0, sizeof(in)); memset(&o, 0, sizeof(o));
-    in.key = str_to_key(b);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    if (smc_call(&in, &o) == KERN_SUCCESS && o.result == 0) { snprintf(out, 5, "%s", b); return 1; }
+    if (key_exists(a)) { snprintf(out, 5, "%s", a); return 1; }
+    if (key_exists(b)) { snprintf(out, 5, "%s", b); return 1; }
     out[0] = 0;
     return 0;
 }
@@ -152,12 +151,12 @@ static inline int fan_md_key(int idx, char out[5]) {
 /* 风扇模式: 0=自动 1=手动 -1=未知 */
 static inline int fan_mode(int idx) {
     char md[5];
-    double v = 0; UInt32 t; char hex[80];
+    double v = 0;
     if (fan_md_key(idx, md)) {
-        if (read_key_value(md, &t, &v, hex) != 0) return -1;
+        if (read_key_value(md, NULL, &v, NULL) != 0) return -1;
         return (int)v == 1 ? 1 : 0;
     }
-    if (read_key_value("FS! ", &t, &v, hex) == 0)
+    if (read_key_value("FS! ", NULL, &v, NULL) == 0)
         return (((int)v) >> idx) & 1;
     return -1;
 }
@@ -180,8 +179,8 @@ static inline void scan_temp_keys(void) {
         char k[5];
         if (get_key_at(i, k) != 0) continue;
         if (k[0] != 'T') continue;
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(k, &t, &v, hex) == 0 && plausible_temp(v)) {
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
             memcpy(list[cnt], k, 5);
             cnt++;
         }
@@ -191,10 +190,10 @@ static inline void scan_temp_keys(void) {
 }
 
 static inline UInt32 total_keys(void) {
-    double v = 0; char hex[80]; UInt32 t;
-    if (read_key_value("#KEY", &t, &v, hex) == 0 && v > 0 && v < 100000) return (UInt32)v;
+    double v = 0;
+    if (read_key_value("#KEY", NULL, &v, NULL) == 0 && v > 0 && v < 100000) return (UInt32)v;
     UInt8 buf[32]; size_t len = sizeof(buf);
-    if (smc_read_key("#KEY", buf, &len) == KERN_SUCCESS && len >= 4) {
+    if (smc_read_key("#KEY", buf, &len, NULL) == KERN_SUCCESS && len >= 4) {
         UInt32 le = buf[0] | buf[1]<<8 | buf[2]<<16 | (UInt32)buf[3]<<24;
         if (le > 0 && le < 100000) return le;
     }
@@ -217,8 +216,8 @@ static inline double hottest_temp(const char **name_out) {
     double mx = -999;
     const char *mxk = NULL;
     for (int i = 0; i < g_tkey_n; i++) {
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(g_tkeys[i], &t, &v, hex) == 0 && plausible_temp(v) && v > mx) {
+        double v;
+        if (read_key_value(g_tkeys[i], NULL, &v, NULL) == 0 && plausible_temp(v) && v > mx) {
             mx = v;
             mxk = g_tkeys[i];
         }

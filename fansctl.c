@@ -2,19 +2,8 @@
  * fansctl - macOS SMC 风扇/温度工具 (Apple Silicon 兼容)
  * 一个程序两种形态: 无参数 = 菜单栏应用(fork 后台); 带参数 = CLI
  * SMC 读取核心在 fansctl.h, 菜单栏界面在 fansbar.m
- *
- * 用法:
- *   fansctl               启动菜单栏应用(自动进后台, 不占用终端)
- *   fansctl fans          列出风扇转速(只读)
- *   fansctl status        当前/目标转速与模式
- *   fansctl temps         列出所有温度传感器
- *   fansctl dump          导出全部 SMC 键值(探索用)
- *   fansctl watch [秒]    循环刷新(默认 2 秒)
- *   sudo fansctl set <rpm> [N]   设定转速(不带 N = 全部风扇)
- *   sudo fansctl max [N]         全速(不带 N = 全部风扇)
- *   sudo fansctl auto [N]        恢复自动(不带 N = 全部风扇)
- *   sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart stop 退出恢复)
- *   sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
+ * 完整子命令列表见 main() 的用法输出 (fans/status/temps/dump/watch 只读;
+ * set/max/auto/smart 需 root)
  */
 #include "fansctl.h"
 
@@ -48,36 +37,17 @@ static kern_return_t smc_write_key(const char *keyname, const UInt8 *buf, size_t
     return KERN_SUCCESS;
 }
 
-static int key_exists(const char *k) {
-    SMCKeyData in = {0}, out = {0};
-    in.key = str_to_key(k);
-    in.data8 = SMC_CMD_READ_KEYINFO;
-    kern_return_t r = smc_call(&in, &out);
-    return r == KERN_SUCCESS && out.result == 0;
-}
-
-/* F?md / F?Md 探测; 找到返回1并填键名, 否则返回0 (用 FS! 位掩码) */
-static int find_md_key(int idx, char out[5]) {
-    char a[5], b[5];
-    snprintf(a, sizeof(a), "F%dmd", idx);
-    snprintf(b, sizeof(b), "F%dMd", idx);
-    if (key_exists(a)) { snprintf(out, 5, "%s", a); return 1; }
-    if (key_exists(b)) { snprintf(out, 5, "%s", b); return 1; }
-    out[0] = 0;
-    return 0;
-}
-
-/* 0=自动 1=手动 -1=未知 (fan_mode 在 fansctl.h) */
+/* F?md / F?Md 探测与模式读取: fan_md_key / fan_mode / key_exists (fansctl.h) */
 
 /* 返回 kern_return_t: KERN_SUCCESS=成功 */
 static kern_return_t write_mode_bit(int idx, int manual) {
     char md[5];
-    if (find_md_key(idx, md)) {
+    if (fan_md_key(idx, md)) {
         UInt8 v = manual ? 1 : 0;
         return smc_write_key(md, &v, 1);
     }
     UInt8 buf[32]; size_t len = sizeof(buf);
-    kern_return_t r = smc_read_key("FS! ", buf, &len);
+    kern_return_t r = smc_read_key("FS! ", buf, &len, NULL);
     if (r != KERN_SUCCESS) return r;
     if (len < 2) return kIOReturnBadArgument;
     UInt16 bits = (UInt16)((buf[0] << 8) | buf[1]);
@@ -184,7 +154,7 @@ static int fan_auto(int idx) {
     /* 释放温控器解锁(可能是此前 set 留下的) */
     if (key_exists("Ftst")) {
         UInt8 buf[32]; size_t len = sizeof(buf);
-        if (smc_read_key("Ftst", buf, &len) == KERN_SUCCESS && len >= 1 && buf[0] == 1) {
+        if (smc_read_key("Ftst", buf, &len, NULL) == KERN_SUCCESS && len >= 1 && buf[0] == 1) {
             UInt8 zero = 0;
             smc_write_key("Ftst", &zero, 1);
         }
@@ -213,18 +183,17 @@ static void print_fans(void) {
     for (char c = '0'; c <= '9'; c++) {
         char k[5];
         snprintf(k, sizeof(k), "F%cAc", c);
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(k, &t, &v, hex) != 0) continue;
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) != 0) continue;
         char km[5], kx[5], kid[5];
         snprintf(km, sizeof(km), "F%cMn", c);
         snprintf(kx, sizeof(kx), "F%cMx", c);
         snprintf(kid, sizeof(kid), "F%cID", c);
         double mn = -1, mx = -1;
-        char hex2[80]; UInt32 t2;
-        read_key_value(km, &t2, &mn, hex2);
-        read_key_value(kx, &t2, &mx, hex2);
+        read_key_value(km, NULL, &mn, NULL);
+        read_key_value(kx, NULL, &mx, NULL);
         char id[32] = ""; UInt8 idbuf[32]; size_t idlen = sizeof(idbuf);
-        if (smc_read_key(kid, idbuf, &idlen) == KERN_SUCCESS && idlen > 0) {
+        if (smc_read_key(kid, idbuf, &idlen, NULL) == KERN_SUCCESS && idlen > 0) {
             size_t L = idlen < sizeof(id) - 1 ? idlen : sizeof(id) - 1;
             memcpy(id, idbuf, L); id[L] = 0;
         }
@@ -245,14 +214,10 @@ static void print_temps(void) {
         char k[5];
         if (get_key_at(i, k) != 0) continue;
         if (k[0] != 'T') continue;
-        double v; UInt32 t; char hex[80];
-        int rc = read_key_value(k, &t, &v, hex);
-        char ts[5]; type_str(t, ts);
-        if (rc == 0 && plausible_temp(v)) {
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
             printf("%-6s %9.2f °C\n", k, v);
             found++;
-        } else if (rc == 1 && strcmp(ts, "flt ") == 0) {
-            /* flt 解码失败的情形不会到这里, 占位 */
         }
     }
     if (!found) printf("未发现温度传感器\n");
@@ -277,8 +242,8 @@ static void print_status_line(void) {
     for (char c = '0'; c <= '9'; c++) {
         char k[5];
         snprintf(k, sizeof(k), "F%cAc", c);
-        double v; UInt32 t; char hex[80];
-        if (read_key_value(k, &t, &v, hex) != 0) continue;
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) != 0) continue;
         printf("风扇%c %6.0f rpm  ", c, v);
     }
     const char *mxk = NULL;
@@ -386,6 +351,17 @@ static void watch_loop(int interval) {
 
 /* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
 
+/* 结束运行中的智能模式: SIGTERM 优雅退出(其信号处理器恢复自动并清 pidfile)。
+   CLI "smart stop" 与隐藏 "__smart stop" 共用 */
+static int smart_stop(void) {
+    int pid; double lo, hi;
+    if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
+    if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
+    for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
+    printf("智能模式已停止(恢复自动)\n");
+    return 0;
+}
+
 /* fansctl __apply max|auto|set <rpm>  — 静默作用于全部风扇, 给菜单栏用 */
 static int apply_cmd(int argc, char **argv) {
     if (argc < 3) return 1;
@@ -412,14 +388,7 @@ static int apply_cmd(int argc, char **argv) {
    自行 fork 守护化: 授权父进程立即退出(菜单栏的授权管道即刻关闭), 子进程脱会话继续跑。
    argv[2]=="stop" 时结束运行中的智能模式 (给 setuid 助手/菜单栏用)。 */
 static int smart_hidden_cmd(int argc, char **argv) {
-    if (argc > 2 && strcmp(argv[2], "stop") == 0) {
-        int pid; double lo, hi;
-        if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
-        if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
-        for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
-        printf("智能模式已停止(恢复自动)\n");
-        return 0;
-    }
+    if (argc > 2 && strcmp(argv[2], "stop") == 0) return smart_stop();
     if (argc > 2 && strcmp(argv[2], "thresh") == 0) {
         /* 更新运行中智能模式的阈值: 改 pidfile + SIGUSR1, 守护进程就地生效 */
         if (argc < 5) { fprintf(stderr, "用法: __smart thresh <低°C> <高°C>\n"); return 1; }
@@ -547,16 +516,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "需要 root 权限:  sudo fansctl smart [低温°C] [高温°C] | stop\n");
             rc = 1;
         } else if (argc > 2 && strcmp(argv[2], "stop") == 0) {
-            int pid; double lo, hi;
-            if (!smart_pid_read(&pid, &lo, &hi)) {
-                fprintf(stderr, "智能模式未在运行\n");
-                rc = 1;
-            } else if (kill(pid, SIGTERM) != 0) {
-                perror("kill");
-                rc = 1;
-            } else {
-                printf("已通知智能模式退出(将恢复自动)\n");
-            }
+            rc = smart_stop();
         } else {
             double t_lo = argc > 2 ? atof(argv[2]) : 40;
             double t_hi = argc > 3 ? atof(argv[3]) : 80;
