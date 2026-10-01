@@ -54,8 +54,21 @@ static int run_root_argv(char *const argv[], BOOL wait_finish) {
     AuthorizationFree(auth, kAuthorizationFlagDefaults);
     if (st != errAuthorizationSuccess) return -1;
     if (pipe) {
-        if (wait_finish) { char buf[256]; while (fgets(buf, sizeof buf, pipe)) {} }
-        fclose(pipe);
+        if (wait_finish) {
+            /* 子进程成功时静默; 有报错输出则记日志并视为失败 (按钮显示 ⚠) */
+            char buf[1024]; size_t got = 0, n;
+            while (got < sizeof buf - 1 && (n = fread(buf + got, 1, sizeof buf - 1 - got, pipe)) > 0)
+                got += n;
+            buf[got] = 0;
+            fclose(pipe);
+            if (got > 0) {
+                FILE *lg = fopen("/tmp/fansctl.bar.log", "a");
+                if (lg) { fprintf(lg, "%s", buf); fclose(lg); }
+                return -1;
+            }
+        } else {
+            fclose(pipe);
+        }
     }
     /* AEWP 子进程是我们直接子进程, tick 里收割僵尸 */
     return 0;
@@ -250,6 +263,9 @@ static BarDelegate *g_bar_delegate; /* 无 ARC, 用全局变量持有 */
 /* fansctl 无参数入口: fork 进后台, 不占用终端 */
 int bar_main(void) {
     if (isatty(STDIN_FILENO)) {
+        /* fork 后父进程立刻退出, script/终端随即关闭 pty 并向会话发 SIGHUP,
+           子进程若尚未 setsid 会被误杀 — 先忽略 SIGHUP 消除竞态 */
+        signal(SIGHUP, SIG_IGN);
         pid_t pid = fork();
         if (pid < 0) { perror("fork"); return 1; }
         if (pid > 0) return 0; /* 父进程立即返回, 终端释放 */

@@ -387,6 +387,7 @@ static void watch_loop(int interval) {
 static int apply_cmd(int argc, char **argv) {
     if (argc < 3) return 1;
     const char *act = argv[2];
+    if (smc_open() != 0) return 1;
     int n = fan_count();
     if (n < 1) n = 1;
     int rc = 0;
@@ -400,6 +401,7 @@ static int apply_cmd(int argc, char **argv) {
     } else {
         rc = 1;
     }
+    smc_close();
     return rc;
 }
 
