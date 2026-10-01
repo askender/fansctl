@@ -1,5 +1,5 @@
 CC = /usr/bin/clang
-CFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation -framework AppKit
+CFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation -framework AppKit -framework Security
 PREFIX = $(HOME)/.local/bin
 
 all: fansctl

@@ -403,13 +403,21 @@ static int apply_cmd(int argc, char **argv) {
     return rc;
 }
 
-/* fansctl __smart 低 高 — root 后台运行的智能模式 (菜单栏启动), pidfile 标记状态 */
+/* fansctl __smart 低 高 — root 后台运行的智能模式 (菜单栏启动), pidfile 标记状态。
+   自行 fork 守护化: 授权父进程立即退出(菜单栏的授权管道即刻关闭), 子进程脱会话继续跑 */
 static int smart_hidden_cmd(int argc, char **argv) {
     double t_lo = argc > 2 ? atof(argv[2]) : 40;
     double t_hi = argc > 3 ? atof(argv[3]) : 80;
     if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) return 1;
     int pid; double a, b;
     if (smart_pid_read(&pid, &a, &b)) return 1; /* 已有实例在跑 */
+    pid_t d = fork();
+    if (d < 0) return 1;
+    if (d > 0) _exit(0);
+    setsid();
+    freopen("/dev/null", "r", stdin);
+    freopen("/tmp/fansctl.smart.log", "a", stdout);
+    freopen("/tmp/fansctl.smart.log", "a", stderr);
     if (smc_open() != 0) return 1;
     smart_pid_write(t_lo, t_hi);
     int rc = smart_loop(t_lo, t_hi);

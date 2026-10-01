@@ -12,7 +12,9 @@
  */
 #import <AppKit/AppKit.h>
 #import <mach-o/dyld.h>
+#import <Security/Security.h>
 #include <limits.h>
+#include <sys/wait.h>
 #include "fansctl.h"
 
 static NSStatusItem *g_item;
@@ -28,35 +30,35 @@ static char g_self[PATH_MAX];
 
 static NSString *U(const char *s) { return [NSString stringWithUTF8String:s ? s : "?"]; }
 
-static NSString *self_path(void) {
-    UInt32 sz = (UInt32)sizeof(g_self);
-    if (_NSGetExecutablePath(g_self, &sz) != 0) return nil;
-    return U(g_self);
-}
-
-static NSString *sh_quote(NSString *s) {
-    return [NSString stringWithFormat:@"'%@'",
-            [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
-}
-
-/* 弹管理员授权框以 root 执行 shell 命令; 失败返回 NO。
-   经 NSTask 调 /usr/bin/osascript (命令行 osascript 从无 Info.plist 的
-   后台进程弹授权窗已验证可用; 而进程内 NSAppleScript 会静默失败)。
-   注意: AppleScript 字符串只认双引号, 不能直接用 sh_quote 的单引号结果。 */
-static BOOL run_root(NSString *shell) {
-    NSString *escaped = [[sh_quote(shell)
-        stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
-        stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-    NSString *script = [NSString stringWithFormat:
-        @"do shell script \"%@\" with administrator privileges", escaped];
-    NSTask *t = [[NSTask alloc] init];
-    t.launchPath = @"/usr/bin/osascript";
-    t.arguments = @[@"-e", script];
-    [t launch];
-    [t waitUntilExit];
-    BOOL ok = t.terminationStatus == 0;
-    [t release];
-    return ok;
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+/* 以 root 直接 exec argv[0] (argv 以 NULL 结尾) — 无 shell 无引号无 osascript。
+   密码框由 SecurityAgent 弹出。返回 0=成功(含用户授权且已启动), -1=取消/失败。
+   注: 不能走 do shell script with administrator privileges — 该路径在无 TTY 的
+   后台进程里会把整条命令串当成单个文件名执行 (ENOENT 127)。 */
+static int run_root_argv(char *const argv[], BOOL wait_finish) {
+    AuthorizationRef auth = NULL;
+    if (AuthorizationCreate(NULL, kAuthorizationEmptyEnvironment,
+                            kAuthorizationFlagDefaults, &auth) != errAuthorizationSuccess)
+        return -1;
+    AuthorizationItem item = {kAuthorizationRightExecute, 0, NULL, 0};
+    AuthorizationRights rights = {1, &item};
+    OSStatus st = AuthorizationCopyRights(auth, &rights, NULL,
+            kAuthorizationFlagInteractionAllowed | kAuthorizationFlagExtendRights, NULL);
+    if (st != errAuthorizationSuccess) {
+        AuthorizationFree(auth, kAuthorizationFlagDefaults);
+        return -1;
+    }
+    FILE *pipe = NULL;
+    st = AuthorizationExecuteWithPrivileges(auth, argv[0], kAuthorizationFlagDefaults,
+                                            (char *const *)&argv[1], &pipe);
+    AuthorizationFree(auth, kAuthorizationFlagDefaults);
+    if (st != errAuthorizationSuccess) return -1;
+    if (pipe) {
+        if (wait_finish) { char buf[256]; while (fgets(buf, sizeof buf, pipe)) {} }
+        fclose(pipe);
+    }
+    /* AEWP 子进程是我们直接子进程, tick 里收割僵尸 */
+    return 0;
 }
 
 static int thresh_idx(void) {
@@ -77,6 +79,7 @@ static int thresh_idx(void) {
 @implementation BarDelegate
 
 - (void)tick {
+    while (waitpid(-1, NULL, WNOHANG) > 0) {} /* 收割 run_root_argv 的僵尸 */
     int pid = 0; double slo = 0, shi = 0;
     int smart = smart_pid_read(&pid, &slo, &shi);
 
@@ -138,6 +141,8 @@ static int thresh_idx(void) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     (void)note;
+    UInt32 sz = (UInt32)sizeof(g_self);
+    if (_NSGetExecutablePath(g_self, &sz) != 0) g_self[0] = 0;
     /* statusItemWithLength 返回不保留对象, 非 ARC 下必须手动 retain,
        否则自动释放池清空后悬空 -> 定时器触发时 SIGSEGV */
     g_item = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
@@ -203,28 +208,31 @@ static int thresh_idx(void) {
 
 - (void)doMax:(id)sender {
     (void)sender;
-    [self flash:run_root([NSString stringWithFormat:@"%@ __apply max", sh_quote(self_path())])
-           ? @"全速 ✓" : @"⚠ 授权失败"];
+    char *argv[] = {g_self, "__apply", "max", NULL};
+    [self flash:run_root_argv(argv, YES) == 0 ? @"全速 ✓" : @"⚠ 授权失败"];
 }
 - (void)doAuto:(id)sender {
     (void)sender;
-    [self flash:run_root([NSString stringWithFormat:@"%@ __apply auto", sh_quote(self_path())])
-           ? @"恢复自动 ✓" : @"⚠ 授权失败"];
+    char *argv[] = {g_self, "__apply", "auto", NULL};
+    [self flash:run_root_argv(argv, YES) == 0 ? @"恢复自动 ✓" : @"⚠ 授权失败"];
 }
 
 - (void)doSmart:(id)sender {
     (void)sender;
     int pid; double slo, shi;
+    char pidstr[16];
     if (smart_pid_read(&pid, &slo, &shi)) {
         /* smart 的 SIGTERM 处理器会恢复自动并清 pidfile */
-        [self flash:run_root([NSString stringWithFormat:@"kill -TERM %d", pid])
-               ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
+        snprintf(pidstr, sizeof pidstr, "%d", pid);
+        char *argv[] = {(char *)"/bin/kill", "-TERM", pidstr, NULL};
+        [self flash:run_root_argv(argv, YES) == 0 ? @"智能已关闭 ✓" : @"⚠ 授权失败"];
     } else {
         int idx = thresh_idx();
-        NSString *sh = [NSString stringWithFormat:
-            @"nohup %@ __smart %.0f %.0f >/dev/null 2>&1 &",
-            sh_quote(self_path()), kThresh[idx][0], kThresh[idx][1]];
-        [self flash:run_root(sh) ? @"智能启动中…" : @"⚠ 授权失败"];
+        char lo[8], hi[8];
+        snprintf(lo, sizeof lo, "%.0f", kThresh[idx][0]);
+        snprintf(hi, sizeof hi, "%.0f", kThresh[idx][1]);
+        char *argv[] = {g_self, "__smart", lo, hi, NULL};
+        [self flash:run_root_argv(argv, NO) == 0 ? @"智能启动中…" : @"⚠ 授权失败"];
     }
 }
 
