@@ -9,6 +9,9 @@
 #include <mach/mach_time.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
+#include <sys/sysctl.h>
+#include <sys/proc_info.h>
+#include <libproc.h>
 #include "fansctl.h"
 
 /* ==================== 写入/控制 (需要 root) ==================== */
@@ -500,6 +503,147 @@ static void print_usb_power(void) {
     if (!n) printf("  (无 USB 设备)\n");
 }
 
+/* ---- 进程功耗排行: 两次采样当前 CPU% (0.4s 窗口) + 常驻内存, 降序 ----
+   每进程 GPU 占用无公开接口 (活动监视器也不分), 笔记本上 CPU 即功耗主导,
+   故按 CPU 排序 */
+struct proc_sample { int pid; uint64_t t_ns, rss; char name[64]; };
+
+static int sample_procs(struct proc_sample **out, struct proc_sample **denied_out, int *ndenied) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len < sizeof(struct kinfo_proc))
+        return -1;
+    struct kinfo_proc *kp = malloc(len);
+    if (!kp) return -1;
+    if (sysctl(mib, 4, kp, &len, NULL, 0) != 0) { free(kp); return -1; }
+    int cnt = (int)(len / sizeof(struct kinfo_proc));
+    struct proc_sample *list = calloc((size_t)(cnt > 0 ? cnt : 1), sizeof *list);
+    struct proc_sample *denied = calloc((size_t)(cnt > 0 ? cnt : 1), sizeof *denied);
+    if (!list || !denied) { free(kp); free(list); free(denied); return -1; }
+    int n = 0, nd = 0;
+    uint64_t tids[4096];
+    for (int i = 0; i < cnt; i++) {
+        int pid = kp[i].kp_proc.p_pid;
+        if (pid <= 0 || kp[i].kp_proc.p_stat == SZOMB) continue;
+        struct proc_taskinfo pti;
+        if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &pti, sizeof pti) <= 0) {
+            /* 在 sysctl 列表里但属性读失败 = 其他用户/受保护进程
+               (task_read_for_pid 只对苹果平台二进制开放, 第三方拿不到) */
+            denied[nd].pid = pid;
+            denied[nd].rss = 0;
+            snprintf(denied[nd].name, sizeof denied[nd].name, "%s", kp[i].kp_proc.p_comm);
+            nd++;
+            continue;
+        }
+        /* CPU 时间必须逐线程累加: proc_taskinfo 的 total 与 threads 两组字段
+           都非单调累计 (threads 组随线程退出回落), 直接做差会回绕 */
+        int tb = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, tids, (int)sizeof tids);
+        if (tb <= 0) {
+            denied[nd].pid = pid;
+            denied[nd].rss = pti.pti_resident_size;
+            snprintf(denied[nd].name, sizeof denied[nd].name, "%s", kp[i].kp_proc.p_comm);
+            nd++;
+            continue;
+        }
+        uint64_t t = 0;
+        for (int k = 0; k < tb / (int)sizeof(uint64_t); k++) {
+            struct proc_threadinfo pth;
+            if (proc_pidinfo(pid, PROC_PIDTHREADINFO, tids[k], &pth, sizeof pth) > 0)
+                t += pth.pth_user_time + pth.pth_system_time;
+        }
+        char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+        const char *nm = kp[i].kp_proc.p_comm; /* 截断名兜底 */
+        if (proc_pidpath(pid, path, sizeof path) > 0 && path[0]) {
+            const char *b = strrchr(path, '/');
+            if (b && b[1]) nm = b + 1;
+        }
+        list[n].pid = pid;
+        list[n].t_ns = t;
+        list[n].rss = pti.pti_resident_size;
+        snprintf(list[n].name, sizeof list[n].name, "%s", nm);
+        n++;
+    }
+    free(kp);
+    *out = list;
+    *denied_out = denied;
+    *ndenied = nd;
+    return n;
+}
+
+struct top_row { double cpu, mempct; uint64_t rss; int pid; char name[64]; };
+
+static int row_cmp(const void *x, const void *y) {
+    double d = ((const struct top_row *)y)->cpu - ((const struct top_row *)x)->cpu;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+static int denied_cmp(const void *x, const void *y) {
+    uint64_t a = ((const struct proc_sample *)x)->rss;
+    uint64_t b = ((const struct proc_sample *)y)->rss;
+    return a < b ? 1 : a > b ? -1 : 0;
+}
+
+static void print_top_procs(void) {
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    struct proc_sample *a = NULL, *b = NULL, *da = NULL, *db = NULL;
+    int nda = 0, ndb = 0;
+    int na = sample_procs(&a, &da, &nda);
+    usleep(400 * 1000); /* 采样窗口 */
+    int nb = sample_procs(&b, &db, &ndb);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed_ns =
+        (double)(ts1.tv_sec - ts0.tv_sec) * 1e9 + (double)(ts1.tv_nsec - ts0.tv_nsec);
+    printf("功耗 Top 进程 (按当前 CPU%% 降序, 0.4 秒采样; 每进程 GPU 无公开数据):\n");
+    if (na <= 0 || nb <= 0 || elapsed_ns <= 0) {
+        printf("  枚举失败\n");
+        free(a); free(b); free(da); free(db);
+        return;
+    }
+    uint64_t memsize = 0;
+    size_t ml = sizeof memsize;
+    sysctl((int[2]){CTL_HW, HW_MEMSIZE}, 2, &memsize, &ml, NULL, 0);
+    struct top_row *rows = calloc((size_t)nb, sizeof *rows);
+    if (!rows) { printf("  内存不足\n"); free(a); free(b); free(da); free(db); return; }
+    int n = 0;
+    for (int j = 0; j < nb; j++)
+        for (int i = 0; i < na; i++)
+            if (a[i].pid == b[j].pid) { /* 两次采样间新出现的进程无基准, 跳过 */
+                /* 线程中途退出会使总时间回落 (无符号差会回绕成天文数字), 钳为 0 */
+                uint64_t d = b[j].t_ns > a[i].t_ns ? b[j].t_ns - a[i].t_ns : 0;
+                rows[n].cpu = (double)d * 100.0 / elapsed_ns;
+                rows[n].rss = b[j].rss;
+                rows[n].pid = b[j].pid;
+                rows[n].mempct = memsize ? (double)b[j].rss * 100.0 / (double)memsize : 0;
+                snprintf(rows[n].name, sizeof rows[n].name, "%s", b[j].name);
+                n++;
+                break;
+            }
+    qsort(rows, (size_t)n, sizeof *rows, row_cmp);
+    printf("  %6s %6s %9s %5s  %s\n", "PID", "CPU", "内存", "%MEM", "进程");
+    int shown = 0;
+    for (int i = 0; i < n && shown < 10 && rows[i].cpu >= 0.1; i++) {
+        double mb = rows[i].rss / 1048576.0;
+        if (mb >= 1024)
+            printf("  %6d %5.1f%% %8.2fG %5.1f  %s\n",
+                   rows[i].pid, rows[i].cpu, mb / 1024, rows[i].mempct, rows[i].name);
+        else
+            printf("  %6d %5.1f%% %8.0fM %5.1f  %s\n",
+                   rows[i].pid, rows[i].cpu, mb, rows[i].mempct, rows[i].name);
+        shown++;
+    }
+    if (!shown) printf("  (全部空闲)\n");
+    /* 无权限读占用的系统/其他用户进程: 列几个名字, 提示 root 可见全部 */
+    if (ndb > 0) {
+        qsort(db, (size_t)ndb, sizeof *db, denied_cmp);
+        printf("  另有 %d 个系统/其他用户进程无权限读取占用 (sudo fansctl power 可见), 如:", ndb);
+        for (int i = 0; i < ndb && i < 3; i++)
+            printf("%s%s", i ? "," : " ", db[i].name);
+        printf("\n");
+    }
+    free(rows); free(a); free(b); free(da); free(db);
+}
+
 static int power_cmd(void) {
     struct power_info p;
     int has_batt = power_read(&p) == 0;
@@ -543,6 +687,7 @@ static int power_cmd(void) {
         printf("电池: 本机无电池\n");
     }
     print_usb_power();
+    print_top_procs();
     return 0;
 }
 
@@ -991,7 +1136,7 @@ int main(int argc, char **argv) {
             "  fans            风扇转速(只读)\n"
             "  status          风扇当前/目标转速与模式\n"
             "  temps           所有温度传感器\n"
-            "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备\n"
+            "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
             "  dump            导出全部 SMC 键\n"
             "  watch [秒]      循环刷新\n"
             "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
