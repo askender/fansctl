@@ -26,4 +26,12 @@ install-root: all
 clean:
 	rm -f fansctl
 
-.PHONY: all clean install uninstall
+# 冒烟测试: 只读命令 + setuid 助手越权防护, 不改变风扇状态
+test: fansctl
+	./smoke.sh
+
+# 重启菜单栏 (LaunchAgent 拉起; 已在运行的智能模式不受影响, setsid 隔离)
+restart:
+	launchctl kickstart -k gui/$(shell id -u)/local.fansctl.bar
+
+.PHONY: all clean install uninstall test restart

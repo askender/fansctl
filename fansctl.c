@@ -256,7 +256,12 @@ static void print_status_line(void) {
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_reload = 0;
-static void on_stop_signal(int sig) { (void)sig; g_stop = 1; }
+static volatile sig_atomic_t g_stop_pid = 0; /* 发停止信号的进程, 排查莫名退出 */
+static void on_stop_signal(int sig, siginfo_t *si, void *ctx) {
+    (void)sig; (void)ctx;
+    if (si && si->si_pid > 0) g_stop_pid = si->si_pid;
+    g_stop = 1;
+}
 static void on_reload_signal(int sig) { (void)sig; g_reload = 1; }
 
 static int smart_loop(double t_lo, double t_hi) {
@@ -266,8 +271,14 @@ static int smart_loop(double t_lo, double t_hi) {
     double last[10], want[10] = {0};
     int manual[10] = {0};
     for (int i = 0; i < 10; i++) last[i] = -1;
-    signal(SIGINT, on_stop_signal);
-    signal(SIGTERM, on_stop_signal);
+    /* SA_SIGINFO 记录停止信号来源 pid (kill 发送者; 终端/内核产生的为 0) */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sa.sa_sigaction = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGUSR1, on_reload_signal); /* __smart thresh <lo> <hi> 就地更新阈值 */
     printf("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
            t_lo, t_hi);
@@ -340,7 +351,11 @@ static int smart_loop(double t_lo, double t_hi) {
     }
     for (int f = 0; f < n; f++)
         if (manual[f]) fan_auto(f);
-    if (g_stop) printf("\n已退出智能模式, 全部恢复自动\n");
+    if (g_stop) {
+        printf("\n已退出智能模式, 全部恢复自动");
+        if (g_stop_pid > 0) printf(" (停止信号来自 pid %d)", (int)g_stop_pid);
+        printf("\n");
+    }
     return rc;
 }
 
