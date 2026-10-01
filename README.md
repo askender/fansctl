@@ -122,3 +122,14 @@ AGPL-3.0-or-later (见 [LICENSE](LICENSE))。任何人可自由使用/修改/分
 但基于本项目的产品(含仅部署为网络服务、不分发二进制的形态)必须以
 AGPL-3.0 开源其衍生代码。**商用允许, 闭源商用违反许可证**;
 若用于商业产品, 欢迎告知作者。
+
+## 致谢
+
+以下三项机制的思路来自 [TomEageer/fanctl](https://github.com/TomEageer/fanctl)
+(Python 实现, MIT 许可), 本项目以 C 独立重新实现:
+
+- 开机兜底恢复 (LaunchDaemon)
+- 健壮性: 唤醒让权 / 模式重申 (MODE_REASSERT) / 写入退避
+- 恒温模式: 目标温度 PI 闭环 (含趋势阻尼)
+
+感谢原作者的开源分享。
