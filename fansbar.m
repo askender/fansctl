@@ -288,6 +288,20 @@ int bar_main(void) {
         freopen("/dev/null", "w", stdout);
         freopen("/tmp/fansctl.bar.log", "a", stderr); /* 排查日志 */
     }
+    {   /* 单实例: 已有活实例则静默退出, 防止重复图标 */
+        FILE *f = fopen("/tmp/fansctl.bar.pid", "r");
+        if (f) {
+            int old = 0;
+            int ok = fscanf(f, "%d", &old) == 1;
+            fclose(f);
+            if (ok && old != (int)getpid() && !(kill(old, 0) != 0 && errno == ESRCH)) {
+                fprintf(stderr, "菜单栏已在运行 (pid %d), 本次退出\n", old);
+                return 0;
+            }
+        }
+        f = fopen("/tmp/fansctl.bar.pid", "w");
+        if (f) { fprintf(f, "%d\n", (int)getpid()); fclose(f); }
+    }
     if (smc_open() != 0) return 1;
     NSApplication *app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyAccessory]; /* 只在菜单栏, 不进 Dock */
