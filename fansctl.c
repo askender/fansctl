@@ -503,10 +503,11 @@ static void print_usb_power(void) {
     if (!n) printf("  (无 USB 设备)\n");
 }
 
-/* ---- 进程功耗排行: 两次采样当前 CPU% (0.4s 窗口) + 常驻内存, 降序 ----
+/* ---- 进程功耗排行: 瞬时 CPU% (0.4s 两次采样) + 平均% (累计÷存活时长) + 内存, 降序 ----
    每进程 GPU 占用无公开接口 (活动监视器也不分), 笔记本上 CPU 即功耗主导,
-   故按 CPU 排序 */
-struct proc_sample { int pid; uint64_t t_ns, rss; char name[64]; };
+   故按 CPU 排序。瞬时% 会放大几秒的短任务 (缩略图/窗口渲染), 平均% 是
+   启动以来的统计值, 不会尖峰; 两列对照即可区分瞬时尖峰与长期大户 */
+struct proc_sample { int pid; uint64_t t_ns, rss; double start_s; char name[64]; };
 
 static int sample_procs(struct proc_sample **out, struct proc_sample **denied_out, int *ndenied) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
@@ -560,6 +561,8 @@ static int sample_procs(struct proc_sample **out, struct proc_sample **denied_ou
         list[n].pid = pid;
         list[n].t_ns = t;
         list[n].rss = pti.pti_resident_size;
+        list[n].start_s = kp[i].kp_proc.p_starttime.tv_sec +
+                          kp[i].kp_proc.p_starttime.tv_usec / 1e6; /* 进程启动时刻 */
         snprintf(list[n].name, sizeof list[n].name, "%s", nm);
         n++;
     }
@@ -570,7 +573,31 @@ static int sample_procs(struct proc_sample **out, struct proc_sample **denied_ou
     return n;
 }
 
-struct top_row { double cpu, mempct; uint64_t rss; int pid; char name[64]; };
+struct top_row { double cpu, avg, mempct; uint64_t rss, cpu_ns; int pid; char name[64]; };
+
+/* 累计 CPU 时间紧凑格式: 45s / 15:49 / 3h05m / 2d05h */
+static void fmt_cpu_ns(uint64_t ns, char out[16]) {
+    double s = ns / 1e9;
+    if (s < 60)         snprintf(out, 16, "%.0fs", s);
+    else if (s < 3600)  snprintf(out, 16, "%d:%02d", (int)(s / 60), (int)fmod(s, 60));
+    else if (s < 86400) snprintf(out, 16, "%dh%02dm", (int)(s / 3600), (int)fmod(s / 60, 60));
+    else                snprintf(out, 16, "%dd%02dh", (int)(s / 86400), (int)fmod(s / 3600, 24));
+}
+
+/* 表头单元格: printf 的 %Ns 按字符数计宽, 中文表头每字显示占 2 列会错位,
+   这里按显示宽度右对齐 (UTF-8 3 字节起的 CJK 记 2 列), 尾随一个空格分隔 */
+static void hdr_cell(const char *s, int width) {
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ) {
+        if (*p < 0x80)      { w += 1; p += 1; }
+        else if (*p < 0xE0) { w += 1; p += 2; }
+        else if (*p < 0xF0) { w += 2; p += 3; }
+        else                { w += 2; p += 4; }
+    }
+    while (width > w) { putchar(' '); width--; }
+    fputs(s, stdout);
+    putchar(' ');
+}
 
 static int row_cmp(const void *x, const void *y) {
     double d = ((const struct top_row *)y)->cpu - ((const struct top_row *)x)->cpu;
@@ -594,7 +621,7 @@ static void print_top_procs(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double elapsed_ns =
         (double)(ts1.tv_sec - ts0.tv_sec) * 1e9 + (double)(ts1.tv_nsec - ts0.tv_nsec);
-    printf("功耗 Top 进程 (按当前 CPU%% 降序, 0.4 秒采样; 每进程 GPU 无公开数据):\n");
+    printf("功耗 Top 进程 (按瞬时 CPU%% 降序; 平均%%=启动以来累计÷存活时长; GPU 无公开数据):\n");
     if (na <= 0 || nb <= 0 || elapsed_ns <= 0) {
         printf("  枚举失败\n");
         free(a); free(b); free(da); free(db);
@@ -603,6 +630,9 @@ static void print_top_procs(void) {
     uint64_t memsize = 0;
     size_t ml = sizeof memsize;
     sysctl((int[2]){CTL_HW, HW_MEMSIZE}, 2, &memsize, &ml, NULL, 0);
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    double now_s = rt.tv_sec + rt.tv_nsec / 1e9;
     struct top_row *rows = calloc((size_t)nb, sizeof *rows);
     if (!rows) { printf("  内存不足\n"); free(a); free(b); free(da); free(db); return; }
     int n = 0;
@@ -612,7 +642,12 @@ static void print_top_procs(void) {
                 /* 线程中途退出会使总时间回落 (无符号差会回绕成天文数字), 钳为 0 */
                 uint64_t d = b[j].t_ns > a[i].t_ns ? b[j].t_ns - a[i].t_ns : 0;
                 rows[n].cpu = (double)d * 100.0 / elapsed_ns;
+                /* 统计均值: 启动以来累计 CPU ÷ 存活时长 (下限 0.5s 防除零) */
+                double alive = now_s - b[j].start_s;
+                if (alive < 0.5) alive = 0.5;
+                rows[n].avg = (double)b[j].t_ns / 1e9 / alive * 100.0;
                 rows[n].rss = b[j].rss;
+                rows[n].cpu_ns = b[j].t_ns; /* 进程启动以来的累计 CPU 时间 */
                 rows[n].pid = b[j].pid;
                 rows[n].mempct = memsize ? (double)b[j].rss * 100.0 / (double)memsize : 0;
                 snprintf(rows[n].name, sizeof rows[n].name, "%s", b[j].name);
@@ -620,16 +655,25 @@ static void print_top_procs(void) {
                 break;
             }
     qsort(rows, (size_t)n, sizeof *rows, row_cmp);
-    printf("  %6s %6s %9s %5s  %s\n", "PID", "CPU", "内存", "%MEM", "进程");
+    fputs("  ", stdout);
+    hdr_cell("PID", 6);   /* 对应 %6d */
+    hdr_cell("CPU", 6);   /* %5.1f%% */
+    hdr_cell("平均", 6);  /* %5.1f%% */
+    hdr_cell("累计", 7);  /* %7s */
+    hdr_cell("内存", 9);  /* %8.0fM / %8.2fG */
+    hdr_cell("%MEM", 5);  /* %5.1f */
+    printf(" %s\n", "进程");
     int shown = 0;
     for (int i = 0; i < n && shown < 10 && rows[i].cpu >= 0.1; i++) {
         double mb = rows[i].rss / 1048576.0;
+        char ct[16];
+        fmt_cpu_ns(rows[i].cpu_ns, ct);
         if (mb >= 1024)
-            printf("  %6d %5.1f%% %8.2fG %5.1f  %s\n",
-                   rows[i].pid, rows[i].cpu, mb / 1024, rows[i].mempct, rows[i].name);
+            printf("  %6d %5.1f%% %5.1f%% %7s %8.2fG %5.1f  %s\n",
+                   rows[i].pid, rows[i].cpu, rows[i].avg, ct, mb / 1024, rows[i].mempct, rows[i].name);
         else
-            printf("  %6d %5.1f%% %8.0fM %5.1f  %s\n",
-                   rows[i].pid, rows[i].cpu, mb, rows[i].mempct, rows[i].name);
+            printf("  %6d %5.1f%% %5.1f%% %7s %8.0fM %5.1f  %s\n",
+                   rows[i].pid, rows[i].cpu, rows[i].avg, ct, mb, rows[i].mempct, rows[i].name);
         shown++;
     }
     if (!shown) printf("  (全部空闲)\n");

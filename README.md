@@ -3,7 +3,7 @@
 macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
-版本: `fansctl version` (当前 1.2.1)。
+版本: `fansctl version` (当前 1.2.2)。
 
 ## 构建与安装
 
@@ -98,7 +98,9 @@ SIGTERM 优雅退出(恢复自动), 日志 `/tmp/fansctl.smart.log`
 - **适配器** — `AdapterDetails` 额定瓦数与 PD 协商电压
 - **USB 设备** — 逐个列出声明的 5V 电流需求 (IOUSBLib 读配置描述符
   bMaxPower, USB2 按 2mA、USB3+ 按 8mA 单位换算), 自供电设备会标注
-- **功耗 Top 进程** — 0.4 秒两次采样的当前 CPU% 降序, 附内存/%MEM/PID;
+- **功耗 Top 进程** — 按瞬时 CPU% 降序 (0.4 秒两次采样), 附平均% (启动以来
+  累计÷存活时长的统计值, 不受短任务尖峰影响)、累计 CPU 时间、内存/%MEM/PID;
+  瞬时高而平均低 = 一过性尖峰 (缩略图/窗口渲染), 两者都高 = 真正的功耗大户;
   macOS 限制: 非特权进程只能读本用户进程的占用 (系统进程如 WindowServer
   需 `sudo fansctl power`), 每进程 GPU 占用无公开接口
 
