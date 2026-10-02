@@ -1,0 +1,37 @@
+name: Bug 报告 / Bug Report
+description: 风扇控制、读数或安装问题 / Fan control, readings or installation issues
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈! 提交前请运行 `fansctl doctor` 并把输出贴到下方 —— 它能覆盖排查所需的几乎全部机器信息。
+        Thanks for the report! Before filing, run `fansctl doctor` and paste its output below — it captures nearly everything needed to diagnose.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象 / What happened
+      description: 期望什么, 实际发生什么 / What you expected vs. what actually happened
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: fansctl doctor 输出 / doctor output
+      render: shell
+      description: 终端运行 `fansctl doctor` 的完整输出 / Full output of `fansctl doctor`
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: fansctl 版本 / Version
+      description: `fansctl version` 的输出 / Output of `fansctl version`
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息 / Anything else
+      description: 复现步骤、日志 (/tmp/fansctl.*.log) 等 / Steps to reproduce, logs, etc.

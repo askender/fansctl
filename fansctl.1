@@ -30,10 +30,14 @@ always stay in Chinese so they remain greppable.
 Fan RPMs, minimum and maximum (read-only).
 .It Ic status
 Current/target RPMs and mode per fan (read-only).
-.It Ic temps
+.It Ic temps Op Fl -sort Op Fl -above Ar N
 All temperature sensors (read-only), with human-readable names where known
 .Pq SoC, CPU P/E-cores, GPU, memory, NAND, battery, airflow...
 and the raw SMC key.
+.Fl -sort
+orders hottest first;
+.Fl -above
+filters by a °C floor.
 .It Ic power
 Power survey (read-only): system draw
 .Pq SMC key PSTR ,

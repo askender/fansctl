@@ -252,21 +252,38 @@ static void print_fans(void) {
     if (!n) printf("%s", L("未发现风扇键(F*Ac)\n", "no fan keys found (F*Ac)\n"));
 }
 
-static void print_temps(void) {
+/* above = 温度下限过滤 (-100 表示不过滤); sort_desc = 按温度降序 */
+static void print_temps(int sort_desc, double above) {
     UInt32 n = total_keys();
     if (!n) { fprintf(stderr, "%s", L("无法获取键总数\n", "cannot get key count\n")); return; }
+    enum { CAP = 1024 };
+    static char ks[CAP][5];
+    static double vs[CAP];
     int found = 0;
-    for (UInt32 i = 0; i < n; i++) {
+    for (UInt32 i = 0; i < n && found < CAP; i++) {
         char k[5];
         if (get_key_at(i, k) != 0) continue;
         if (k[0] != 'T') continue;
         double v;
-        if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
-            const char *nm = temp_key_name(k, g_lang_en);
-            if (nm) printf("%-6s %-16s %9.2f °C\n", k, nm, v);
-            else    printf("%-6s %18.2f °C\n", k, v);
+        if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v) && v >= above) {
+            memcpy(ks[found], k, 5);
+            vs[found] = v;
             found++;
         }
+    }
+    if (sort_desc) {
+        /* 简单选择排序配对挪动 (found<=1024, 无需 qsort 的间接层) */
+        for (int i = 0; i < found; i++)
+            for (int j = i + 1; j < found; j++)
+                if (vs[j] > vs[i]) {
+                    double tv = vs[i]; vs[i] = vs[j]; vs[j] = tv;
+                    char tk[5]; memcpy(tk, ks[i], 5); memcpy(ks[i], ks[j], 5); memcpy(ks[j], tk, 5);
+                }
+    }
+    for (int i = 0; i < found; i++) {
+        const char *nm = temp_key_name(ks[i], g_lang_en);
+        if (nm) printf("%-6s %-16s %9.2f °C\n", ks[i], nm, vs[i]);
+        else    printf("%-6s %18.2f °C\n", ks[i], vs[i]);
     }
     if (!found) printf("%s", L("未发现温度传感器\n", "no temperature sensors found\n"));
 }
@@ -302,30 +319,53 @@ static void print_status_line(void) {
 
 /* ==================== JSON 输出 (--json) ==================== */
 
-/* 字符串转义 (UTF-8 原样透传, 只转义 JSON 语法字符与控制字符) */
-static void json_str(const char *s) {
-    putchar('"');
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+/* 字符串转义进缓冲区 (UTF-8 原样透传, 只转义 JSON 语法字符与控制字符)。
+   独立成 buffer 版以便 __selftest 直接断言 */
+static void json_escape(char *out, size_t n, const char *s) {
+    size_t w = 0;
+    if (!n) return;
+    for (const unsigned char *p = (const unsigned char *)s; *p && w < n - 1; p++) {
+        const char *esc = NULL; char tmp[8];
         switch (*p) {
-        case '"':  fputs("\\\"", stdout); break;
-        case '\\': fputs("\\\\", stdout); break;
-        case '\b': fputs("\\b", stdout); break;
-        case '\f': fputs("\\f", stdout); break;
-        case '\n': fputs("\\n", stdout); break;
-        case '\r': fputs("\\r", stdout); break;
-        case '\t': fputs("\\t", stdout); break;
+        case '"':  esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\b': esc = "\\b"; break;
+        case '\f': esc = "\\f"; break;
+        case '\n': esc = "\\n"; break;
+        case '\r': esc = "\\r"; break;
+        case '\t': esc = "\\t"; break;
         default:
-            if (*p < 0x20) printf("\\u%04x", *p);
-            else putchar(*p);
+            if (*p < 0x20) { snprintf(tmp, sizeof tmp, "\\u%04x", *p); esc = tmp; }
         }
+        if (esc) {
+            size_t el = strlen(esc);
+            if (w + el >= n) break;
+            memcpy(out + w, esc, el); w += el;
+        } else out[w++] = (char)*p;
     }
-    putchar('"');
+    out[w] = 0;
+}
+
+static void json_str(const char *s) {
+    char buf[1024];
+    json_escape(buf, sizeof buf, s);
+    printf("\"%s\"", buf);
+}
+
+/* 数值格式化进缓冲区: 未知约定为 <=-0.5, 输出 null, 其余按精度 */
+static void jnum_buf(char *out, size_t n, double v, int prec) {
+    if (v <= -0.5) snprintf(out, n, "null");
+    else {
+        if (v < 0) v = 0; /* -0.x 归一, 防 JSON 里出现 "-0" */
+        snprintf(out, n, "%.*f", prec, v);
+    }
 }
 
 /* 数值打 null 或数字: 未知约定为 -1, 其余按精度输出 (电流这类合法负数字段不用此函数) */
 static void jnum(double v, int prec) {
-    if (v <= -0.5) fputs("null", stdout);
-    else printf("%.*f", prec, v);
+    char buf[32];
+    jnum_buf(buf, sizeof buf, v, prec);
+    fputs(buf, stdout);
 }
 
 static void json_fans(void) {
@@ -1579,6 +1619,12 @@ static int doctor_cmd(void) {
         }
         else
             printf("%s", L("温度传感器: 未发现\n", "Temperature sensors: none found\n"));
+        int unnamed = 0;
+        for (int i = 0; i < g_tkey_n; i++)
+            if (!temp_key_name(g_tkeys[i], 0)) unnamed++;
+        printf(L("未命名传感器: %d 个 (欢迎提 issue 补充命名表)\n",
+                 "unnamed sensors: %d (issues welcome to extend the naming table)\n"),
+               unnamed);
         printf(L("PSTR (机器功率键): %s\n", "PSTR (system power key): %s\n"),
                key_exists("PSTR") ? L("存在", "present") : L("不存在", "absent"));
         printf(L("Ftst (手动模式解锁键): %s\n", "Ftst (manual-mode unlock key): %s\n"),
@@ -1653,6 +1699,111 @@ static int doctor_cmd(void) {
                    "Please attach this full output when filing an issue.\n"));
     return 0;
 }
+/* ==================== 内置自测 (__selftest, 无需 SMC/root) ====================
+   纯函数表驱动断言, CI 虚拟机 (无 AppleSMC) 也能跑; 命名表/JSON 转义/plist 解析
+   这类逻辑改动当场回归。守护 pidfile 往返测试在有守护进程运行时会踩状态文件,
+   探测到即跳过 */
+static int g_st_n = 0, g_st_fail = 0;
+static void st_ok(int cond, const char *what) {
+    g_st_n++;
+    if (cond) { printf("  PASS  %s\n", what); return; }
+    g_st_fail++;
+    printf("  FAIL  %s\n", what);
+}
+static void st_streq(const char *got, const char *want, const char *what) {
+    g_st_n++;
+    if (got && strcmp(got, want) == 0) { printf("  PASS  %s\n", what); return; }
+    g_st_fail++;
+    printf("  FAIL  %s\n        got \"%s\" want \"%s\"\n",
+           what, got ? got : "(null)", want);
+}
+static int selftest_cmd(void) {
+    printf("%s", L("[自测] 传感器命名表\n", "[selftest] sensor naming table\n"));
+    st_streq(temp_key_name("TB0T", 0), "电池", "TB0T zh");
+    st_streq(temp_key_name("TB0T", 1), "Battery", "TB0T en");
+    st_streq(temp_key_name("TW0P", 1), "AirPort (Wi-Fi)", "TW0P en");
+    st_streq(temp_key_name("TS0P", 0), "掌托左", "TS0P zh");
+    st_streq(temp_key_name("TAOL", 1), "Ambient", "TAOL en");
+    st_streq(temp_key_name("Tp05", 0), "CPU 性能核", "Tp05 zh family");
+    st_streq(temp_key_name("Te01", 1), "CPU E-core", "Te01 en family");
+    st_streq(temp_key_name("Tg04", 1), "GPU core", "Tg04 en family");
+    st_streq(temp_key_name("Tm02", 0), "内存", "Tm02 zh family");
+    st_streq(temp_key_name("TH0x", 1), "NAND flash", "TH0x en family");
+    st_streq(temp_key_name("Th00", 1), "NAND flash", "Th00 en family");
+    st_streq(temp_key_name("Tz11", 0), "热区", "Tz11 zh family");
+    st_streq(temp_key_name("TCMz", 1), "SoC", "TCMz en family");
+    st_streq(temp_key_name("TC10", 0), "SoC 组", "TC10 zh family");
+    st_streq(temp_key_name("TaLP", 0), "气流·左", "TaLP zh family");
+    st_streq(temp_key_name("TaRF", 1), "Airflow R", "TaRF en family");
+    st_streq(temp_key_name("Ta05", 0), "气流", "Ta05 zh family");
+    st_streq(temp_key_name("TB3T", 1), "Battery", "TB3T en pattern");
+    st_ok(temp_key_name("TD00", 0) == NULL, "TD00 无映射");
+    st_ok(temp_key_name("TPD0", 1) == NULL, "TPD0 无映射");
+    st_ok(temp_key_name("TVMD", 0) == NULL, "TVMD 无映射");
+    st_ok(temp_key_name("Tpx", 0) == NULL, "短键 Tpx 不误匹配");
+    st_ok(temp_key_name("Tp05x", 0) == NULL, "长键不误匹配");
+    st_ok(temp_key_name("F0Ac", 0) == NULL, "非温度键无映射");
+
+    printf("%s", L("[自测] JSON 转义与数值\n", "[selftest] JSON escaping & numbers\n"));
+    char b[256];
+    json_escape(b, sizeof b, "a\"b\\c\nd");
+    st_streq(b, "a\\\"b\\\\c\\nd", "json_escape 转义 \" \\ \\n");
+    json_escape(b, sizeof b, "中文°C");
+    st_streq(b, "中文°C", "json_escape UTF-8 透传");
+    json_escape(b, sizeof b, "a\x01");
+    st_streq(b, "a\\u0001", "json_escape 控制字符");
+    jnum_buf(b, sizeof b, -1, 0);   st_streq(b, "null", "jnum 未知=null");
+    jnum_buf(b, sizeof b, 70.256, 2); st_streq(b, "70.26", "jnum 精度");
+    jnum_buf(b, sizeof b, -0.4, 0); st_streq(b, "0", "jnum -0.4 边界");
+
+    printf("%s", L("[自测] plist 解析与 XML 转义\n", "[selftest] plist parsing & XML escaping\n"));
+    const char *tpl = "/tmp/fansctl-selftest.plist";
+    FILE *f = fopen(tpl, "w");
+    fputs("<?xml version=\"1.0\"?><plist><dict><key>Label</key><string>local.test</string>"
+          "<key>ProgramArguments</key><array><string>/bin/fansctl</string></array>"
+          "</dict></plist>", f);
+    fclose(f);
+    char prog[64];
+    plist_prog(tpl, prog, sizeof prog);
+    st_streq(prog, "/bin/fansctl", "plist_prog 取 ProgramArguments");
+    f = fopen(tpl, "w"); fputs("<plist><dict><key>Label</key></dict></plist>", f); fclose(f);
+    plist_prog(tpl, prog, sizeof prog);
+    st_streq(prog, "", "plist_prog 缺 ProgramArguments -> 空");
+    unlink(tpl);
+    f = tmpfile();
+    xml_esc(f, "a&b<c>");
+    rewind(f);
+    size_t got = fread(b, 1, sizeof b - 1, f);
+    b[got] = 0;
+    fclose(f);
+    st_streq(b, "a&amp;b&lt;c&gt;", "xml_esc 转义");
+
+    printf("%s", L("[自测] 温度合理区间\n", "[selftest] temperature plausibility\n"));
+    st_ok(!plausible_temp(-10) && plausible_temp(0) && plausible_temp(60) &&
+          plausible_temp(129.9) && !plausible_temp(130), "plausible_temp 边界");
+
+    printf("%s", L("[自测] 守护 pidfile 往返\n", "[selftest] daemon pidfile roundtrip\n"));
+    if (access(SMART_PIDFILE, F_OK) == 0 || access(HOLD_PIDFILE, F_OK) == 0)
+        printf("%s", L("  SKIP  有守护进程在跑, 不踩它的状态文件\n",
+                       "  SKIP  a daemon is running, not touching its state files\n"));
+    else {
+        int p; double lo = 0, hi = 0, ht = 0;
+        smart_pid_write(45, 85);
+        st_ok(smart_pid_read(&p, &lo, &hi) && p == (int)getpid() && lo == 45 && hi == 85,
+              "smart pidfile 写读往返");
+        smart_pid_clear();
+        st_ok(access(SMART_PIDFILE, F_OK) != 0, "smart pidfile 清除");
+        hold_pid_write(70);
+        st_ok(hold_pid_read(&p, &ht) && p == (int)getpid() && ht == 70,
+              "hold pidfile 写读往返");
+        hold_pid_clear();
+        st_ok(access(HOLD_PIDFILE, F_OK) != 0, "hold pidfile 清除");
+    }
+
+    printf(L("自测: %d 项, 失败 %d 项\n", "selftest: %d checks, %d failed\n"), g_st_n, g_st_fail);
+    return g_st_fail ? 1 : 0;
+}
+
 /* 用法输出 — 不依赖 SMC: 无 AppleSMC 的环境 (如 CI 虚拟机) 敲错命令也能看到帮助 */
 static void print_usage(void) {
     fprintf(stderr, "%s", L(
@@ -1660,7 +1811,7 @@ static void print_usage(void) {
         "      fansctl <子命令>   命令行模式\n"
         "  fans            风扇转速(只读)\n"
         "  status          风扇当前/目标转速与模式\n"
-        "  temps           所有温度传感器\n"
+        "  temps [--sort] [--above N]  所有温度传感器 (--sort 最热在前)\n"
         "  power [--watch [秒]]  供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
         "  dump            导出全部 SMC 键\n"
         "  watch [秒]      循环刷新\n"
@@ -1683,7 +1834,7 @@ static void print_usage(void) {
         "      fansctl <command>   command line mode\n"
         "  fans            fan RPMs (read-only)\n"
         "  status          current/target RPMs and mode\n"
-        "  temps           all temperature sensors\n"
+        "  temps [--sort] [--above N]  all temperature sensors (--sort: hottest first)\n"
         "  power [--watch [sec]]  power survey: system draw, input, adapter, USB, top processes\n"
         "  dump            dump all SMC keys\n"
         "  watch [sec]     refresh loop\n"
@@ -1737,6 +1888,7 @@ int main(int argc, char **argv) {
     g_debug = getenv("FANSCTL_DEBUG") != NULL;
     if (strcmp(cmd, "bar") == 0) return bar_cmd(argc, argv);       /* 不碰 SMC */
     if (strcmp(cmd, "doctor") == 0) return doctor_cmd();           /* SMC 可选, 自行容错 */
+    if (strcmp(cmd, "__selftest") == 0) return selftest_cmd();     /* 纯逻辑断言, 无需 SMC */
 
 
     for (int i = 2; i < argc; i++)
@@ -1765,10 +1917,19 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "status") == 0) {
         if (g_json) json_status(); else print_status();
     } else if (strcmp(cmd, "temps") == 0) {
-        if (g_json) json_temps(); else print_temps();
+        if (g_json) json_temps(); else {
+            int tsort = 0;
+            double tabove = -100;
+            for (int i = 2; i < argc; i++) {
+                if (strcmp(argv[i], "--sort") == 0) tsort = 1;
+                else if (strcmp(argv[i], "--above") == 0 && i + 1 < argc)
+                    tabove = atof(argv[++i]);
+            }
+            print_temps(tsort, tabove);
+        }
     } else if (strcmp(cmd, "power") == 0) {
         int widx = -1;
-        for (int i = 3; i < argc; i++)
+        for (int i = 2; i < argc; i++)
             if (strcmp(argv[i], "--watch") == 0) { widx = i; break; }
         if (widx >= 0) {
             int interval = 5;

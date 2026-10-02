@@ -8,7 +8,7 @@ macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 菜单栏界面中英双语(跟系统语言, 菜单可切换); CLI 同样跟随系统语言
 (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`, 可用 `FANSCTL_LANG=zh|en` 强制)。
 守护进程日志 (/tmp/fansctl.smart.log 等) 恒为中文, 保证可 grep。
-版本: `fansctl version` (当前 1.6.0)。
+版本: `fansctl version` (当前 1.7.0)。
 
 ## 构建与安装
 
@@ -25,6 +25,7 @@ make                # 编译出 ./fansctl
 make install        # 装到 ~/.local/bin (先删后拷, AMFI 坑)
 make install-root   # 装 setuid root 助手到 /usr/local/bin/fansctl-root (要一次密码)
 make test           # 冒烟测试 (只读, 不动风扇)
+./fansctl __selftest  # 纯逻辑自测 (命名表/JSON/plist 解析), 无需 SMC
 make restart        # 重启菜单栏 (LaunchAgent 拉起)
 ```
 
@@ -37,8 +38,9 @@ make restart        # 重启菜单栏 (LaunchAgent 拉起)
 fansctl               启动菜单栏应用(fork 后台, 不占终端)
 fansctl fans          列出风扇转速(只读)
 fansctl status        当前/目标转速与模式(只读)
-fansctl temps         所有温度传感器(只读), 已识别的显示人类可读名
-                      (SoC / CPU 性能核·能效核 / GPU / 内存 / 闪存 / 电池 / 气流等)
+fansctl temps [--sort] [--above N]  所有温度传感器, 已识别的显示人类可读名
+                      (SoC / CPU 性能核·能效核 / GPU / 内存 / 闪存 / 电池 / 气流等);
+                      --sort 最热在前, --above 按 °C 过滤
 fansctl power         供电/功率一览(只读): 功率, 电源输入, 适配器, USB 设备, 功耗Top进程
 fansctl power --watch [秒]   持续功率监测(默认 5 秒)
 fansctl dump          导出全部 SMC 键值(探索用)

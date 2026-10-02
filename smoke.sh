@@ -21,6 +21,10 @@ echo "[temps] 温度传感器"
 [ "$(./fansctl temps | grep -c '°C')" -ge 1 ] && ok "有温度读数" || bad "temps 无温度"
 ./fansctl temps | grep -qE '电池|CPU|GPU|SoC|内存|气流|闪存|热区|掌托|无线|环境' \
     && ok "传感器人类可读名出现" || bad "命名表未生效"
+t1=$(./fansctl temps --sort | head -1 | awk '{print $(NF-1)}')
+t2=$(./fansctl temps --sort | sed -n 2p | awk '{print $(NF-1)}')
+awk -v a="$t1" -v b="$t2" 'BEGIN{exit !(a>=b)}' && ok "temps --sort 降序" || bad "temps --sort 乱序"
+./fansctl temps --sort --above 500 | grep -q '未发现' && ok "--above 过滤生效" || bad "--above 过滤失效"
 ./fansctl temps --json | grep -q '"name"' && ok "temps --json 含 name 字段" || bad "temps --json 缺 name"
 
 echo "[power] 供电/功率一览"
@@ -28,6 +32,9 @@ echo "[power] 供电/功率一览"
 ./fansctl power --watch 1 2>/dev/null | head -2 | grep -q "W" && ok "power --watch 文本流" || bad "power --watch 异常"
 ./fansctl power --json --watch 1 2>/dev/null | head -1 | python3 -m json.tool >/dev/null 2>&1 \
     && ok "power --watch --json JSONL" || bad "power --watch --json 非法"
+# 真循环验证: 3 秒应出 3 行 (回归: 参数解析 off-by-one 曾让 --watch 被静默忽略)
+[ "$(./fansctl power --json --watch 1 2>/dev/null | head -3 | wc -l | tr -d ' ')" = "3" ] \
+    && ok "power --watch 真循环 (3s=3行)" || bad "power --watch 没有循环"
 
 echo "[--json] 机器可读输出 (回归: usb 数组曾漏闭合括号)"
 for c in fans status temps power; do
@@ -60,6 +67,7 @@ echo "[bar/doctor] 不依赖 SMC 的子命令"
 ./fansctl bar status >/dev/null 2>&1 && ok "bar status 可跑" || bad "bar status 异常"
 ./fansctl __nope__ --json >/dev/null 2>&1 && bad "未知命令+--json 应报错" || ok "--json 越界命令被拒"
 ./fansctl doctor >/dev/null 2>&1 && ok "doctor 可跑 (rc=0)" || bad "doctor 异常"
+./fansctl __selftest > /tmp/fansctl-selftest.out 2>&1 && ok "__selftest 全过" || { bad "__selftest 失败"; tail -8 /tmp/fansctl-selftest.out; }
 
 echo "[helper] setuid 助手越权防护"
 H=/usr/local/bin/fansctl-root

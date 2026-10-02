@@ -26,8 +26,10 @@ fi
 
 local sub=$words[2]
 case $sub in
-  fans|status|temps)
+  fans|status)
     _arguments '--json[machine-readable JSON output]' ;;
+  temps)
+    _arguments '--json[machine-readable JSON output]' '--sort[hottest first]' '--above[°C floor]:temperature:' ;;
   power)
     _arguments '--json[one JSON object per line]' '--watch[continuous monitoring]' '1:interval seconds:' ;;
   watch)

@@ -12,7 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.6.0"
+#define FANSCTL_VERSION "1.7.0"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
@@ -157,9 +157,13 @@ static inline const char *temp_key_name(const char *key, int en) {
         const struct temp_name_tab *tab = t == 0 ? exact : fam;
         for (int i = 0; tab[i].pat; i++) {
             int ok = 1;
-            for (int c = 0; tab[i].pat[c]; c++)
-                if (tab[i].pat[c] != '?' &&
-                    (c >= 4 || key[c] == 0 || key[c] != tab[i].pat[c])) { ok = 0; break; }
+            for (int c = 0; tab[i].pat[c]; c++) {
+                if (tab[i].pat[c] == '?') { /* 通配要求该位确有字符, 短键在此安全落选 */
+                    if (key[c] == 0) { ok = 0; break; }
+                    continue;
+                }
+                if (key[c] != tab[i].pat[c]) { ok = 0; break; }
+            }
             if (ok && key[strlen(tab[i].pat)] == 0) return en ? tab[i].en : tab[i].zh;
         }
     }

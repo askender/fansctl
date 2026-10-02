@@ -19,7 +19,7 @@ language and can be switched at any time from the menu. The CLI follows
 your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
 override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 `/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.6.0).
+are kept grep-stable. Version: `fansctl version` (currently 1.7.0).
 
 ## Build & install
 
@@ -36,6 +36,7 @@ make                # build ./fansctl
 make install        # install to ~/.local/bin (rm-then-cp: AMFI quirk)
 make install-root   # install setuid-root helper to /usr/local/bin/fansctl-root (one password)
 make test           # smoke test (read-only, never touches fan state)
+./fansctl __selftest  # pure-logic unit checks (naming table, JSON, plist) — no SMC needed
 make restart        # restart the menu bar (relaunched by the LaunchAgent)
 ```
 
@@ -49,8 +50,9 @@ helper; pure UI/read-only changes do not need it.
 fansctl               start the menu-bar app (forks to background)
 fansctl fans          list fan RPMs (read-only)
 fansctl status        current/target RPMs and mode (read-only)
-fansctl temps         all temperature sensors, human-readable names where known
-                      (SoC, CPU P/E-cores, GPU, memory, NAND, battery, airflow)
+fansctl temps [--sort] [--above N]  all temperature sensors, human-readable names where
+                      known (SoC, CPU P/E-cores, GPU, memory, NAND, battery, airflow);
+                      --sort hottest first, --above filters by °C
 fansctl power         power survey (read-only): system draw, input, adapter, USB, top processes
 fansctl power --watch [sec]   continuous power monitoring (default 5 s)
 fansctl dump          dump all SMC keys (exploration)

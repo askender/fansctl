@@ -2,6 +2,17 @@
 
 格式: 每个版本一节, GitHub Actions 发布 workflow 按 `## vX.Y.Z` 切片生成 Release 正文。
 
+## v1.7.0
+
+- `fansctl temps --sort [--above N]`: 按温度降序、下限过滤 (237 行温度墙三行看清)
+- `fansctl __selftest`: 内置纯逻辑自测 (命名表/JSON 转义/plist 解析/pidfile 往返,
+  34 项), 无需 SMC, CI 虚拟机可跑; 顺手修了命名表匹配器短键越界隐患与
+  JSON 数值 "-0" 输出
+- `fansctl doctor` 增加未命名传感器计数 (欢迎提 issue 众包命名表)
+- .github issue 模板 (bug 报告直接附 doctor 输出)
+- 修复 v1.6.0 引入的 `power --watch` 参数解析 off-by-one —— flag 被静默忽略
+  只输出一次; 冒烟测试新增真循环断言 (3 秒必须 3 行)
+
 ## v1.6.0
 
 - 温度传感器人类可读名: `temps` 第三列与 `doctor` 最热行显示
