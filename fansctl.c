@@ -1080,6 +1080,45 @@ static int smart_hidden_cmd(int argc, char **argv) {
     return rc;
 }
 
+/* 用法输出 — 不依赖 SMC: 无 AppleSMC 的环境 (如 CI 虚拟机) 敲错命令也能看到帮助 */
+static void print_usage(void) {
+    fprintf(stderr, "%s", L(
+        "用法: fansctl            启动菜单栏应用(fork 后台, 不占终端)\n"
+        "      fansctl <子命令>   命令行模式\n"
+        "  fans            风扇转速(只读)\n"
+        "  status          风扇当前/目标转速与模式\n"
+        "  temps           所有温度传感器\n"
+        "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
+        "  dump            导出全部 SMC 键\n"
+        "  watch [秒]      循环刷新\n"
+        "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
+        "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
+        "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
+        "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
+        "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
+        "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
+        "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
+        "  hold stop       结束恒温模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
+        "  version         版本号\n",
+        "Usage: fansctl            start the menu-bar app (forks to background)\n"
+        "      fansctl <command>   command line mode\n"
+        "  fans            fan RPMs (read-only)\n"
+        "  status          current/target RPMs and mode\n"
+        "  temps           all temperature sensors\n"
+        "  power           power survey: system draw, input, adapter, USB, top processes\n"
+        "  dump            dump all SMC keys\n"
+        "  watch [sec]     refresh loop\n"
+        "  set <rpm> [N]   set RPM, all fans without N (sudo)\n"
+        "  max [N]         full speed, all fans without N (sudo)\n"
+        "  auto [N]        back to automatic, all fans without N (sudo)\n"
+        "  smart [lo hi]   smart curve, default 40~80°C (sudo)\n"
+        "  smart stop      stop smart mode (incl. menu-bar instances), restore auto (sudo)\n"
+        "  hold <°C>       thermostat: PI loop holds the hottest sensor at target,\n"
+        "                  default 70°C; mutually exclusive with smart (sudo)\n"
+        "  hold stop       stop thermostat (incl. menu-bar instances), restore auto (sudo)\n"
+        "  version         print version\n"));
+}
+
 int main(int argc, char **argv) {
     cli_lang_init();
     const char *cmd = argc > 1 ? argv[1] : NULL;
@@ -1111,6 +1150,16 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "__hold") == 0) return hold_hidden_cmd(argc, argv);
     if (strcmp(cmd, "__ask") == 0) return ask_main(argc, argv);
     g_debug = getenv("FANSCTL_DEBUG") != NULL;
+
+    /* 未知命令直接给用法再退出 — 不开 SMC (无 AppleSMC 的环境也可见帮助) */
+    {
+        static const char *const known[] = {"fans", "status", "temps", "power", "dump",
+                                            "watch", "set", "max", "auto", "smart", "hold", NULL};
+        int is_known = 0;
+        for (int i = 0; known[i]; i++)
+            if (strcmp(cmd, known[i]) == 0) { is_known = 1; break; }
+        if (!is_known) { print_usage(); return 1; }
+    }
     if (smc_open() != 0) return 1;
     int rc = 0;
 
@@ -1233,44 +1282,6 @@ int main(int argc, char **argv) {
                 hold_pid_clear();
             }
         }
-    } else {
-        fprintf(stderr, "%s", L(
-            "用法: fansctl            启动菜单栏应用(fork 后台, 不占终端)\n"
-            "      fansctl <子命令>   命令行模式\n"
-            "  fans            风扇转速(只读)\n"
-            "  status          风扇当前/目标转速与模式\n"
-            "  temps           所有温度传感器\n"
-            "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
-            "  dump            导出全部 SMC 键\n"
-            "  watch [秒]      循环刷新\n"
-            "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
-            "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
-            "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
-            "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
-            "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
-            "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
-            "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
-            "  hold stop       结束恒温模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
-            "  version         版本号\n",
-            "Usage: fansctl            start the menu-bar app (forks to background)\n"
-            "      fansctl <command>   command line mode\n"
-            "  fans            fan RPMs (read-only)\n"
-            "  status          current/target RPMs and mode\n"
-            "  temps           all temperature sensors\n"
-            "  power           power survey: system draw, input, adapter, USB, top processes\n"
-            "  dump            dump all SMC keys\n"
-            "  watch [sec]     refresh loop\n"
-            "  set <rpm> [N]   set RPM, all fans without N (sudo)\n"
-            "  max [N]         full speed, all fans without N (sudo)\n"
-            "  auto [N]        back to automatic, all fans without N (sudo)\n"
-            "  smart [lo hi]   smart curve, default 40~80°C (sudo)\n"
-            "  smart stop      stop smart mode (incl. menu-bar instances), restore auto (sudo)\n"
-            "  hold <°C>       thermostat: PI loop holds the hottest sensor at target,\n"
-            "                  default 70°C; mutually exclusive with smart (sudo)\n"
-            "  hold stop       stop thermostat (incl. menu-bar instances), restore auto (sudo)\n"
-            "  version         print version\n"));
-        smc_close();
-        return 1;
     }
     smc_close();
     return rc;
