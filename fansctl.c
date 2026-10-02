@@ -1432,6 +1432,22 @@ static int run_launchctl(char *const args[], int quiet) {
     return rc;
 }
 
+/* 杀掉占着 pidfile 的存活菜单栏实例 (SIGTERM, 等它退场最多 ~2s)。
+   菜单栏进程 fork+setsid 后 PPID=1, launchd 的 bootout/kickstart 只认自己
+   拉起的那一代 —— 手动启动或已退代实例必须从这里清, 否则单实例守卫
+   会让 install/restart 拉起来的新实例立刻退出, 栏上静默跑着旧版 */
+static void bar_kill_running(void) {
+    FILE *f = fopen(BAR_PIDFILE, "r");
+    int pid = 0;
+    if (f) {
+        if (fscanf(f, "%d", &pid) != 1) pid = 0;
+        fclose(f);
+    }
+    if (pid <= 1 || kill(pid, 0) != 0) return;
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 20 && kill(pid, 0) == 0; i++) usleep(100 * 1000);
+}
+
 static void xml_esc(FILE *f, const char *s) {
     for (; *s; s++) {
         if (*s == '&')      fputs("&amp;", f);
@@ -1486,6 +1502,7 @@ static int bar_cmd(int argc, char **argv) {
     if (strcmp(sub, "install") == 0) {
         char exe[PATH_MAX];
         if (self_path(exe) != 0) { fprintf(stderr, "%s", L("无法定位自身路径\n", "cannot resolve own path\n")); return 1; }
+        bar_kill_running(); /* launchd 不管的手动实例先退场, 否则单实例守卫让新实例起不来 */
         char dir[PATH_MAX];
         snprintf(dir, sizeof dir, "%s/Library/LaunchAgents", home);
         mkdir(dir, 0755); /* 已存在则 EEXIST, 忽略 */
@@ -1524,6 +1541,7 @@ static int bar_cmd(int argc, char **argv) {
     }
     if (strcmp(sub, "uninstall") == 0) {
         run_launchctl(bootout, 1); /* 未加载也无妨 */
+        bar_kill_running(); /* launchd 之外的存活实例不会被 bootout 带走 */
         if (unlink(plist) != 0 && errno != ENOENT) { perror(plist); return 1; }
         printf("%s", L("已卸载: 菜单栏停止, LaunchAgent 已移除\n",
                        "Uninstalled: menu-bar app stopped, LaunchAgent removed\n"));

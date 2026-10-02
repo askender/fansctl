@@ -55,8 +55,10 @@ analyze: fansctl.c fansbar.m fansctl.h
 test: fansctl
 	./smoke.sh
 
-# 重启菜单栏 (LaunchAgent 拉起; 已在运行的智能模式不受影响, setsid 隔离)
+# 重启菜单栏: 先杀占 pidfile 的实例 (栏进程 setsid 后 launchd 的 -k 不一定够得着),
+# 再 kickstart 拉起新实例
 restart:
-	launchctl kickstart -k gui/$(shell id -u)/local.fansctl.bar
+	-kill $$(cat /tmp/fansctl.bar.pid) 2>/dev/null
+	launchctl kickstart gui/$(shell id -u)/local.fansctl.bar
 
 .PHONY: all clean install uninstall test restart analyze

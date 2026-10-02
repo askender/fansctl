@@ -2,6 +2,13 @@
 
 格式: 每个版本一节, GitHub Actions 发布 workflow 按 `## vX.Y.Z` 切片生成 Release 正文。
 
+## v1.7.1
+
+- 修复 `bar install/uninstall` 与 `make restart` 对"launchd 之外实例"无效:
+  菜单栏进程 setsid 后 launchd 只认自己拉起的那一代, 手动启动的旧实例
+  会顶住单实例守卫让新实例静默退出, 栏上一直跑旧版。现在 install/uninstall
+  会按 pidfile 显式清存活实例, restart 同理
+
 ## v1.7.0
 
 - `fansctl temps --sort [--above N]`: 按温度降序、下限过滤 (237 行温度墙三行看清)

@@ -19,7 +19,7 @@ language and can be switched at any time from the menu. The CLI follows
 your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
 override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 `/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.7.0).
+are kept grep-stable. Version: `fansctl version` (currently 1.7.1).
 
 ## Build & install
 
