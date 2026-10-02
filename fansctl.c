@@ -1181,15 +1181,16 @@ static void json_power(void) {
 /* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
 
 /* pidfile 里的 pid 现在还是不是我们的守护进程? pid 复用后盲目 kill 会误伤无辜
-   进程: proc_pidpath 对比可执行文件路径, 与自身 (含菜单栏等价的启动路径) 不符
-   即拒绝发送信号。查不到路径时保守放弃 kill, 提示手工处理 */
-static int self_path(char out[PATH_MAX]); /* 定义在 LaunchAgent 管理一节 */
+   进程。守卫按可执行文件名: 守护可能由多个入口拉起 —— CLI `sudo fansctl smart`
+   (装好的 fansctl)、setuid 助手 `__smart` (fansctl-root 副本)、仓库里的开发二进制
+   —— 路径各异但文件名只有 fansctl / fansctl-root 两种。文件名不符 = 大概率
+   pid 复用, 拒绝发信号; 查不到路径时同样保守拒绝 */
 static int pid_is_ours(int pid) {
     char path[PATH_MAX];
     if (proc_pidpath(pid, path, sizeof path) <= 0) return 0;
-    char self[PATH_MAX];
-    if (self_path(self) != 0) return 0;
-    return strcmp(path, self) == 0;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strcasecmp(base, "fansctl") == 0 || strcasecmp(base, "fansctl-root") == 0;
 }
 
 /* 结束运行中的智能模式: SIGTERM 优雅退出(其信号处理器恢复自动并清 pidfile)。

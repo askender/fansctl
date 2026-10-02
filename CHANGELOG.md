@@ -2,6 +2,13 @@
 
 格式: 每个版本一节, GitHub Actions 发布 workflow 按 `## vX.Y.Z` 切片生成 Release 正文。
 
+## v1.8.1
+
+- 修复 v1.8.0 引入的 `smart stop`/`hold stop` 误判: pid 核验原要求进程可执行
+  路径与自身完全一致, 但守护进程由 setuid 助手 (fansctl-root) 拉起时路径
+  必然不同 —— 一律拒绝发信号, 停止失败。改按文件名核验 (fansctl /
+  fansctl-root), 既防 pid 复用误杀, 又兼容三种拉起入口 (CLI/助手/仓库二进制)
+
 ## v1.8.0
 
 - 智能模式功耗前馈: 热量还没到风扇先动。PSTR 秒级整机功耗经"快慢 EMA 差"
