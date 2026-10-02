@@ -3,6 +3,7 @@
 # 不触碰风扇状态、不需要 root; 特权动词(__apply/__smart)不在测试范围。
 set -u
 cd "$(dirname "$0")"
+export FANSCTL_LANG=zh   # 固定中文, 断言不受本机 locale 影响
 fail=0
 ok()  { echo "  PASS  $1"; }
 bad() { echo "  FAIL  $1"; fail=1; }
@@ -25,6 +26,11 @@ echo "[dump] 全量键导出 (回归: 曾因 >26 字节键 hex 拼接越界 SIGA
 n=$(./fansctl fans | grep -c "风扇")
 echo "[FNum] 风扇数量"
 [ "$n" -ge 1 ] && ok "发现 $n 个风扇" || bad "无风扇"
+
+echo "[i18n] CLI 双语 (FANSCTL_LANG 强制)"
+./fansctl __nope__ 2>&1 | grep -q "用法" && ok "中文帮助" || bad "中文帮助缺失"
+FANSCTL_LANG=en ./fansctl __nope__ 2>&1 | grep -q "Usage" && ok "英文帮助生效" || bad "FANSCTL_LANG=en 无效"
+FANSCTL_LANG=en ./fansctl status | grep -q "mode" && ok "英文 status 生效" || bad "英文 status 失败"
 
 echo "[helper] setuid 助手越权防护"
 H=/usr/local/bin/fansctl-root

@@ -14,6 +14,22 @@
 #include <libproc.h>
 #include "fansctl.h"
 
+/* ==================== CLI 双语 (跟随系统语言) ====================
+   FANSCTL_LANG > LC_ALL > LC_MESSAGES > LANG, zh* 前缀 = 中文, 其余 = 英文;
+   全部未设置 = 中文 —— GUI 上下文 (LaunchAgent/菜单栏) 无 LANG, 由它拉起的
+   守护进程日志 (/tmp/fansctl.smart.log 等) 由此恒为中文, 便于 grep。
+   菜单栏界面另有独立可运行时切换的 L()/lang_init() (fansbar.m), 互不影响。 */
+static int g_lang_en;
+static const char *L(const char *zh, const char *en) { return g_lang_en ? en : zh; }
+
+static void cli_lang_init(void) {
+    const char *v = getenv("FANSCTL_LANG");
+    if (!v || !*v) v = getenv("LC_ALL");
+    if (!v || !*v) v = getenv("LC_MESSAGES");
+    if (!v || !*v) v = getenv("LANG");
+    g_lang_en = (v && *v && strncmp(v, "zh", 2) != 0);
+}
+
 /* ==================== 写入/控制 (需要 root) ==================== */
 
 static void print_fans(void);
@@ -71,26 +87,30 @@ static int engage_manual(int idx) {
     kern_return_t r = write_mode_bit(idx, 1);
     if (r == KERN_SUCCESS) return 0;
     if (r == KR_NOT_PRIVILEGED) {
-        fprintf(stderr, "开启手动模式失败: 权限不足, 请用 sudo 运行\n");
+        fprintf(stderr, "%s", L("开启手动模式失败: 权限不足, 请用 sudo 运行\n",
+                                "failed to enable manual mode: permission denied, run with sudo\n"));
         return -1;
     }
     if (!key_exists("Ftst")) {
-        fprintf(stderr, "开启手动模式失败: kr=0x%x (无 Ftst 解锁键可用)\n", r);
+        fprintf(stderr, L("开启手动模式失败: kr=0x%x (无 Ftst 解锁键可用)\n",
+                          "failed to enable manual mode: kr=0x%x (no Ftst unlock key)\n"), r);
         return -1;
     }
     UInt8 one = 1;
     if (smc_write_key("Ftst", &one, 1) != KERN_SUCCESS) {
-        fprintf(stderr, "写入 Ftst 解锁失败\n");
+        fprintf(stderr, "%s", L("写入 Ftst 解锁失败\n", "failed to write Ftst unlock\n"));
         return -1;
     }
     ftst_held = 1;
-    fprintf(stderr, "已向温控管理器申请解锁(Ftst=1)，等待 3 秒...\n");
+    fprintf(stderr, "%s", L("已向温控管理器申请解锁(Ftst=1)，等待 3 秒...\n",
+                            "unlock requested from thermal controller (Ftst=1), waiting 3 s...\n"));
     sleep(3);
     for (int attempt = 0; attempt < 300; attempt++) {
         if (write_mode_bit(idx, 1) == KERN_SUCCESS) return 0;
         usleep(100 * 1000);
     }
-    fprintf(stderr, "解锁后仍无法开启手动模式\n");
+    fprintf(stderr, "%s", L("解锁后仍无法开启手动模式\n",
+                            "manual mode still unavailable after unlock\n"));
     return -1;
 }
 
@@ -102,7 +122,7 @@ static int write_tg(int idx, double rpm) {
     in.key = str_to_key(k);
     in.data8 = SMC_CMD_READ_KEYINFO;
     if (smc_call(&in, &out) != KERN_SUCCESS || out.result != 0) {
-        fprintf(stderr, "未找到 %s 键\n", k);
+        fprintf(stderr, L("未找到 %s 键\n", "key %s not found\n"), k);
         return -1;
     }
     UInt8 data[8]; size_t dlen;
@@ -116,7 +136,7 @@ static int write_tg(int idx, double rpm) {
         data[0] = (UInt8)(v >> 8); data[1] = (UInt8)(v & 0xff);
         dlen = 2;
     } else {
-        fprintf(stderr, "不支持的目标键类型: %s\n", ts);
+        fprintf(stderr, L("不支持的目标键类型: %s\n", "unsupported target key type: %s\n"), ts);
         return -1;
     }
     /* 写入退避: SMC 忙(0x82 温控器占用)时指数退避重试, 总计约 1.5 秒, 不硬敲 */
@@ -124,7 +144,8 @@ static int write_tg(int idx, double rpm) {
         if (smc_write_key(k, data, dlen) == KERN_SUCCESS) return 0;
         if (attempt < 5) usleep(ms * 1000);
     }
-    fprintf(stderr, "写入 %s 失败 (SMC 可能拒绝: 0x82=温控器占用, 0x86=键只读)\n", k);
+    fprintf(stderr, L("写入 %s 失败 (SMC 可能拒绝: 0x82=温控器占用, 0x86=键只读)\n",
+                      "failed to write %s (SMC may refuse: 0x82=controller busy, 0x86=readonly)\n"), k);
     return -1;
 }
 
@@ -139,7 +160,8 @@ static int fan_set(int idx, double rpm) {
     if (read_rpm_key(idx, "Mx", &mx) != 0) mx = 6000;
     if (rpm < mn || rpm > mx) {
         double clamped = rpm < mn ? mn : mx;
-        fprintf(stderr, "转速限制到 %.0f rpm (安全范围 %.0f~%.0f)\n", clamped, mn, mx);
+        fprintf(stderr, L("转速限制到 %.0f rpm (安全范围 %.0f~%.0f)\n",
+                          "RPM clamped to %.0f (safe range %.0f~%.0f)\n"), clamped, mn, mx);
         rpm = clamped;
     }
     return fan_apply(idx, rpm);
@@ -154,8 +176,8 @@ static int fan_max(int idx) {
 static int fan_auto(int idx) {
     kern_return_t r = write_mode_bit(idx, 0);
     if (r != KERN_SUCCESS) {
-        fprintf(stderr, "恢复自动失败: kr=0x%x%s\n", r,
-                r == KR_NOT_PRIVILEGED ? " (需要 sudo)" : "");
+        fprintf(stderr, L("恢复自动失败: kr=0x%x%s\n", "failed to restore auto: kr=0x%x%s\n"), r,
+                r == KR_NOT_PRIVILEGED ? L(" (需要 sudo)", " (sudo required)") : "");
         return -1;
     }
     write_tg(idx, 0); /* 目标清零, 尽力而为 */
@@ -173,7 +195,7 @@ static int fan_auto(int idx) {
 
 static void print_status(void) {
     int n = fan_count();
-    if (!n) { printf("FNum 未找到, 尝试枚举...\n"); print_fans(); return; }
+    if (!n) { printf("%s", L("FNum 未找到, 尝试枚举...\n", "FNum not found, enumerating...\n")); print_fans(); return; }
     for (int i = 0; i < n; i++) {
         double ac = -1, tg = -1, mn = -1, mx = -1;
         read_rpm_key(i, "Ac", &ac);
@@ -181,8 +203,10 @@ static void print_status(void) {
         read_rpm_key(i, "Mn", &mn);
         read_rpm_key(i, "Mx", &mx);
         int mode = fan_mode(i);
-        printf("风扇%d  当前 %7.0f  目标 %7.0f  [%.0f~%.0f]  模式 %s\n",
-               i, ac, tg, mn, mx, mode == 1 ? "手动" : mode == 0 ? "自动" : "未知");
+        printf(L("风扇%d  当前 %7.0f  目标 %7.0f  [%.0f~%.0f]  模式 %s\n",
+                 "Fan %d  current %7.0f  target %7.0f  [%.0f~%.0f]  mode %s\n"),
+               i, ac, tg, mn, mx,
+               mode == 1 ? L("手动", "manual") : mode == 0 ? L("自动", "auto") : L("未知", "?"));
     }
 }
 
@@ -202,21 +226,23 @@ static void print_fans(void) {
         read_key_value(kx, NULL, &mx, NULL);
         char id[32] = ""; UInt8 idbuf[32]; size_t idlen = sizeof(idbuf);
         if (smc_read_key(kid, idbuf, &idlen, NULL) == KERN_SUCCESS && idlen > 0) {
-            size_t L = idlen < sizeof(id) - 1 ? idlen : sizeof(id) - 1;
-            memcpy(id, idbuf, L); id[L] = 0;
+            size_t keep = idlen < sizeof(id) - 1 ? idlen : sizeof(id) - 1;
+            memcpy(id, idbuf, keep); id[keep] = 0;
         }
         if (id[0])
-            printf("风扇%c  %-16s 当前 %7.0f rpm   [下限 %7.0f / 上限 %7.0f]\n", c, id, v, mn, mx);
+            printf(L("风扇%c  %-16s 当前 %7.0f rpm   [下限 %7.0f / 上限 %7.0f]\n",
+                     "Fan %c  %-16s current %7.0f rpm   [min %7.0f / max %7.0f]\n"), c, id, v, mn, mx);
         else
-            printf("风扇%c  当前 %7.0f rpm   [下限 %7.0f / 上限 %7.0f]\n", c, v, mn, mx);
+            printf(L("风扇%c  当前 %7.0f rpm   [下限 %7.0f / 上限 %7.0f]\n",
+                     "Fan %c  current %7.0f rpm   [min %7.0f / max %7.0f]\n"), c, v, mn, mx);
         n++;
     }
-    if (!n) printf("未发现风扇键(F*Ac)\n");
+    if (!n) printf("%s", L("未发现风扇键(F*Ac)\n", "no fan keys found (F*Ac)\n"));
 }
 
 static void print_temps(void) {
     UInt32 n = total_keys();
-    if (!n) { fprintf(stderr, "无法获取键总数\n"); return; }
+    if (!n) { fprintf(stderr, "%s", L("无法获取键总数\n", "cannot get key count\n")); return; }
     int found = 0;
     for (UInt32 i = 0; i < n; i++) {
         char k[5];
@@ -228,13 +254,13 @@ static void print_temps(void) {
             found++;
         }
     }
-    if (!found) printf("未发现温度传感器\n");
+    if (!found) printf("%s", L("未发现温度传感器\n", "no temperature sensors found\n"));
 }
 
 static void print_dump(void) {
     UInt32 n = total_keys();
-    if (!n) { fprintf(stderr, "无法获取键总数\n"); return; }
-    printf("SMC 键总数: %u\n\n", n);
+    if (!n) { fprintf(stderr, "%s", L("无法获取键总数\n", "cannot get key count\n")); return; }
+    printf(L("SMC 键总数: %u\n\n", "SMC key count: %u\n\n"), n);
     for (UInt32 i = 0; i < n; i++) {
         char k[5];
         if (get_key_at(i, k) != 0) continue;
@@ -256,7 +282,7 @@ static void print_status_line(void) {
     }
     const char *mxk = NULL;
     double mx = hottest_temp(&mxk);
-    if (mx > -999) printf(" 最热 %s %.1f°C", mxk ? mxk : "?", mx);
+    if (mx > -999) printf(L(" 最热 %s %.1f°C", " hottest %s %.1f°C"), mxk ? mxk : "?", mx);
     printf("\n");
 }
 
@@ -294,7 +320,9 @@ static int smart_loop(double t_lo, double t_hi) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGUSR1, on_reload_signal); /* __smart thresh <lo> <hi> 就地更新阈值 */
-    printf("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
+    printf(L("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
+             "Smart mode: <=%.0f°C auto (baseline follows system), >=%.0f°C full speed, "
+             "linear in between; Ctrl+C exits and restores auto\n"),
            t_lo, t_hi);
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
@@ -307,7 +335,7 @@ static int smart_loop(double t_lo, double t_hi) {
                 nl >= 20 && nh >= nl + 5 && nh <= 120) {
                 t_lo = nl;
                 t_hi = nh;
-                printf("[阈值更新为 %.0f~%.0f°C]\n", t_lo, t_hi);
+                printf(L("[阈值更新为 %.0f~%.0f°C]\n", "[thresholds updated to %.0f~%.0f°C]\n"), t_lo, t_hi);
                 fflush(stdout);
             }
         }
@@ -321,7 +349,7 @@ static int smart_loop(double t_lo, double t_hi) {
                 if (smc_open() != 0) continue;
                 T = hottest_temp(&tkey);
             }
-            if (T < -999) { fprintf(stderr, "温度读取失败(已重试)\n"); rc = 1; break; }
+            if (T < -999) { fprintf(stderr, "%s", L("温度读取失败(已重试)\n", "temperature read failed (after retries)\n")); rc = 1; break; }
         }
         double frac = (T - t_lo) / (t_hi - t_lo);
         if (frac < 0) frac = 0;
@@ -343,7 +371,8 @@ static int smart_loop(double t_lo, double t_hi) {
                 read_rpm_key(f, "Tg", &tg);
                 if ((m >= 0 && m != 1) ||
                     (m == 1 && tg > 0 && last[f] > 0 && fabs(tg - last[f]) > 150)) {
-                    printf("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                    printf(L("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                             "[fan %d overridden externally (mode=%d target=%.0f expected=%.0f), retaking]\n"),
                            f, m, tg, last[f]);
                     fflush(stdout);
                     if (m == 1) last[f] = -1; /* 目标被改, 本拍重写 */
@@ -376,14 +405,16 @@ static int smart_loop(double t_lo, double t_hi) {
             }
         }
         if (rc != 0) break;
-        printf("[%.0f~%.0f°C] %s %.1f°C 曲线%.0f%% |", t_lo, t_hi, tkey ? tkey : "?", T, frac * 100);
+        printf(L("[%.0f~%.0f°C] %s %.1f°C 曲线%.0f%% |", "[%.0f~%.0f°C] %s %.1f°C curve %.0f%% |"),
+               t_lo, t_hi, tkey ? tkey : "?", T, frac * 100);
         for (int f = 0; f < n; f++) {
             double ac = -1;
             read_rpm_key(f, "Ac", &ac);
             if (manual[f] && want[f] > 0 && base[f] > 0)
-                printf(" 风扇%d %6.0f rpm (+%.0f%%) 手动", f, ac, (want[f] - base[f]) / base[f] * 100);
+                printf(L(" 风扇%d %6.0f rpm (+%.0f%%) 手动", " fan %d %6.0f rpm (+%.0f%%) manual"),
+                       f, ac, (want[f] - base[f]) / base[f] * 100);
             else
-                printf(" 风扇%d %6.0f rpm 自动", f, ac);
+                printf(L(" 风扇%d %6.0f rpm 自动", " fan %d %6.0f rpm auto"), f, ac);
         }
         printf("\n");
         fflush(stdout);
@@ -393,7 +424,8 @@ static int smart_loop(double t_lo, double t_hi) {
         uint64_t dt = cont_ns() - tick_ns;
         tick_ns = cont_ns();
         if (dt > 5ULL * 1000000000ULL) {
-            printf("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n", dt / 1e9);
+            printf(L("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n",
+                     "[gap %.0f s, system wake detected, handing control back for 5 s]\n"), dt / 1e9);
             for (int f = 0; f < n; f++)
                 if (manual[f]) {
                     if (fan_auto(f) != 0) { rc = 1; break; }
@@ -409,8 +441,8 @@ static int smart_loop(double t_lo, double t_hi) {
     for (int f = 0; f < n; f++)
         if (manual[f]) fan_auto(f);
     if (g_stop) {
-        printf("\n已退出智能模式, 全部恢复自动");
-        if (g_stop_pid > 0) printf(" (停止信号来自 pid %d)", (int)g_stop_pid);
+        printf("%s", L("\n已退出智能模式, 全部恢复自动", "\nSmart mode exited, all fans restored to auto"));
+        if (g_stop_pid > 0) printf(L(" (停止信号来自 pid %d)", " (stop signal from pid %d)"), (int)g_stop_pid);
         printf("\n");
     }
     return rc;
@@ -456,10 +488,11 @@ static int usb_declared_ma(io_object_t service, int bcd_usb, int *self_powered) 
 
 static void print_usb_power(void) {
     io_iterator_t it = MACH_PORT_NULL;
-    printf("USB 设备 (声明的 5V 电流需求, 非实测):\n");
+    printf("%s", L("USB 设备 (声明的 5V 电流需求, 非实测):\n",
+                   "USB devices (declared 5V current draw, not measured):\n"));
     if (IOServiceGetMatchingServices(kIOMainPortDefault,
                                      IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS) {
-        printf("  枚举失败\n");
+        printf("%s", L("  枚举失败\n", "  enumeration failed\n"));
         return;
     }
     io_object_t dev;
@@ -490,17 +523,19 @@ static void print_usb_power(void) {
             int selfp = 0;
             int ma = usb_declared_ma(dev, bcd > 0 ? (int)bcd : 0, &selfp);
             if (ma > 0)
-                printf("  - %s (%s)  %s  %d mA ≈ %.1f W%s\n", name, vendor, sp, ma,
-                       ma * 5.0 / 1000.0, selfp ? " [自供电]" : "");
+                printf(L("  - %s (%s)  %s  %d mA ≈ %.1f W%s\n", "  - %s (%s)  %s  %d mA ≈ %.1f W%s\n"),
+                       name, vendor, sp, ma, ma * 5.0 / 1000.0,
+                       selfp ? L(" [自供电]", " [self-powered]") : "");
             else
-                printf("  - %s (%s)  %s  电流未知\n", name, vendor, sp);
+                printf(L("  - %s (%s)  %s  电流未知\n", "  - %s (%s)  %s  current unknown\n"),
+                       name, vendor, sp);
             n++;
         }
         CFRelease(props);
         IOObjectRelease(dev);
     }
     IOObjectRelease(it);
-    if (!n) printf("  (无 USB 设备)\n");
+    if (!n) printf("%s", L("  (无 USB 设备)\n", "  (no USB devices)\n"));
 }
 
 /* ---- 进程功耗排行: 瞬时 CPU% (0.4s 两次采样) + 平均% (累计÷存活时长) + 内存, 降序 ----
@@ -621,9 +656,10 @@ static void print_top_procs(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double elapsed_ns =
         (double)(ts1.tv_sec - ts0.tv_sec) * 1e9 + (double)(ts1.tv_nsec - ts0.tv_nsec);
-    printf("功耗 Top 进程 (按瞬时 CPU%% 降序; 平均%%=启动以来累计÷存活时长; GPU 无公开数据):\n");
+    printf("%s", L("功耗 Top 进程 (按瞬时 CPU% 降序; 平均%=启动以来累计÷存活时长; GPU 无公开数据):\n",
+                   "Top power processes (by instantaneous CPU%, desc; avg% = cumulative÷lifetime; no public GPU data):\n"));
     if (na <= 0 || nb <= 0 || elapsed_ns <= 0) {
-        printf("  枚举失败\n");
+        printf("%s", L("  枚举失败\n", "  enumeration failed\n"));
         free(a); free(b); free(da); free(db);
         return;
     }
@@ -634,7 +670,7 @@ static void print_top_procs(void) {
     clock_gettime(CLOCK_REALTIME, &rt);
     double now_s = rt.tv_sec + rt.tv_nsec / 1e9;
     struct top_row *rows = calloc((size_t)nb, sizeof *rows);
-    if (!rows) { printf("  内存不足\n"); free(a); free(b); free(da); free(db); return; }
+    if (!rows) { printf("%s", L("  内存不足\n", "  out of memory\n")); free(a); free(b); free(da); free(db); return; }
     int n = 0;
     for (int j = 0; j < nb; j++)
         for (int i = 0; i < na; i++)
@@ -656,13 +692,13 @@ static void print_top_procs(void) {
             }
     qsort(rows, (size_t)n, sizeof *rows, row_cmp);
     fputs("  ", stdout);
-    hdr_cell("PID", 6);   /* 对应 %6d */
-    hdr_cell("CPU", 6);   /* %5.1f%% */
-    hdr_cell("平均", 6);  /* %5.1f%% */
-    hdr_cell("累计", 7);  /* %7s */
-    hdr_cell("内存", 9);  /* %8.0fM / %8.2fG */
-    hdr_cell("%MEM", 5);  /* %5.1f */
-    printf(" %s\n", "进程");
+    hdr_cell("PID", 6);                 /* 对应 %6d */
+    hdr_cell("CPU", 6);                 /* %5.1f%% */
+    hdr_cell(L("平均", "Avg"), 6);      /* %5.1f%% */
+    hdr_cell(L("累计", "Total"), 7);    /* %7s */
+    hdr_cell(L("内存", "Mem"), 9);      /* %8.0fM / %8.2fG */
+    hdr_cell("%MEM", 5);                /* %5.1f */
+    printf(" %s\n", L("进程", "Process"));
     int shown = 0;
     for (int i = 0; i < n && shown < 10 && rows[i].cpu >= 0.1; i++) {
         double mb = rows[i].rss / 1048576.0;
@@ -676,11 +712,13 @@ static void print_top_procs(void) {
                    rows[i].pid, rows[i].cpu, rows[i].avg, ct, mb, rows[i].mempct, rows[i].name);
         shown++;
     }
-    if (!shown) printf("  (全部空闲)\n");
+    if (!shown) printf("%s", L("  (全部空闲)\n", "  (all idle)\n"));
     /* 无权限读占用的系统/其他用户进程: 列几个名字, 提示 root 可见全部 */
     if (ndb > 0) {
         qsort(db, (size_t)ndb, sizeof *db, denied_cmp);
-        printf("  另有 %d 个系统/其他用户进程无权限读取占用 (sudo fansctl power 可见), 如:", ndb);
+        printf(L("  另有 %d 个系统/其他用户进程无权限读取占用 (sudo fansctl power 可见), 如:",
+                 "  %d more system/other-user processes unreadable without privileges (visible via sudo fansctl power), e.g.:"),
+               ndb);
         for (int i = 0; i < ndb && i < 3; i++)
             printf("%s%s", i ? "," : " ", db[i].name);
         printf("\n");
@@ -696,39 +734,46 @@ static int power_cmd(void) {
     read_key_value("PSTR", NULL, &pw, NULL);
     if (pw > 0 && pw < 1000) {
         if (p.charge_w > 0 && pw > p.charge_w)
-            printf("机器功率: %.0f W (PSTR) = 系统 %.0f W + 充电 %.0f W\n",
+            printf(L("机器功率: %.0f W (PSTR) = 系统 %.0f W + 充电 %.0f W\n",
+                     "System power: %.0f W (PSTR) = %.0f W system + %.0f W charging\n"),
                    pw, pw - p.charge_w, p.charge_w);
         else
-            printf("机器功率: %.0f W (PSTR, 秒级实时)\n", pw);
+            printf(L("机器功率: %.0f W (PSTR, 秒级实时)\n",
+                     "System power: %.0f W (PSTR, real-time at second level)\n"), pw);
     } else {
-        printf("机器功率: 未知 (本机无 PSTR 键)\n");
+        printf("%s", L("机器功率: 未知 (本机无 PSTR 键)\n",
+                       "System power: unknown (no PSTR key on this machine)\n"));
     }
     if (p.sys_v > 0 && p.sys_i > 0) {
         double w = p.sys_w > 0 ? p.sys_w : p.sys_v * p.sys_i;
-        printf("电源输入: %.1f V × %.2f A = %.1f W (实测, 遥测约分钟级刷新)\n",
+        printf(L("电源输入: %.1f V × %.2f A = %.1f W (实测, 遥测约分钟级刷新)\n",
+                 "Power input: %.1f V × %.2f A = %.1f W (measured, telemetry refreshes ~every minute)\n"),
                p.sys_v, p.sys_i, w);
     } else if (p.ext) {
-        printf("电源输入: 已连接 (无实时遥测)\n");
+        printf("%s", L("电源输入: 已连接 (无实时遥测)\n", "Power input: connected (no real-time telemetry)\n"));
     } else {
-        printf("电源输入: 未连接 (电池供电)\n");
+        printf("%s", L("电源输入: 未连接 (电池供电)\n", "Power input: none (running on battery)\n"));
     }
     if (p.adapter_w > 0) {
         char av[32] = "";
-        if (p.adapter_v > 0) snprintf(av, sizeof av, ", 协商 %d V", p.adapter_v);
-        printf("适配器: %d W 额定%s\n", p.adapter_w, av);
+        if (p.adapter_v > 0) snprintf(av, sizeof av, L(", 协商 %d V", ", negotiated %d V"), p.adapter_v);
+        printf(L("适配器: %d W 额定%s\n", "Adapter: %d W rated%s\n"), p.adapter_w, av);
     } else if (p.ext) {
-        printf("适配器: 已连接 (额定功率未知)\n");
+        printf("%s", L("适配器: 已连接 (额定功率未知)\n", "Adapter: connected (rated watts unknown)\n"));
     }
     if (has_batt) {
         if (p.charging && p.charge_w > 0)
-            printf("电池: 充电中 %.2f V / %.0f mA (%.1f W)\n", p.batt_v, p.batt_a, p.charge_w);
+            printf(L("电池: 充电中 %.2f V / %.0f mA (%.1f W)\n",
+                     "Battery: charging %.2f V / %.0f mA (%.1f W)\n"), p.batt_v, p.batt_a, p.charge_w);
         else if (p.batt_a < -50)
-            printf("电池: 放电 %.2f V / %.0f mA (%.1f W)\n",
+            printf(L("电池: 放电 %.2f V / %.0f mA (%.1f W)\n",
+                     "Battery: discharging %.2f V / %.0f mA (%.1f W)\n"),
                    p.batt_v, -p.batt_a, -p.batt_a * p.batt_v / 1000.0);
         else
-            printf("电池: %.2f V / %.0f mA (未充放)\n", p.batt_v, p.batt_a);
+            printf(L("电池: %.2f V / %.0f mA (未充放)\n",
+                     "Battery: %.2f V / %.0f mA (idle)\n"), p.batt_v, p.batt_a);
     } else {
-        printf("电池: 本机无电池\n");
+        printf("%s", L("电池: 本机无电池\n", "Battery: none on this machine\n"));
     }
     print_usb_power();
     print_top_procs();
@@ -741,7 +786,7 @@ static int power_cmd(void) {
    CLI "smart stop" 与隐藏 "__smart stop" 共用 */
 static int smart_stop(void) {
     int pid; double lo, hi;
-    if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
+    if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "%s", L("智能模式未在运行\n", "smart mode is not running\n")); return 1; }
     if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
     /* 等守护进程完成收尾(恢复自动 + 清 pidfile)再返回, 否则它的退出清理会
        覆盖调用方紧接着的设速(实测: stop 后立即 __apply max 被 fan_auto 覆盖)。
@@ -754,11 +799,12 @@ static int smart_stop(void) {
     {
         int p; double l, h;
         if (smart_pid_read(&p, &l, &h) && p == pid) {
-            fprintf(stderr, "智能模式 10 秒内未完成退出, 请查 /tmp/fansctl.smart.log\n");
+            fprintf(stderr, "%s", L("智能模式 10 秒内未完成退出, 请查 /tmp/fansctl.smart.log\n",
+                                    "smart mode did not exit within 10 s, check /tmp/fansctl.smart.log\n"));
             return 1;
         }
     }
-    printf("智能模式已停止(恢复自动)\n");
+    printf("%s", L("智能模式已停止(恢复自动)\n", "smart mode stopped (auto restored)\n"));
     return 0;
 }
 
@@ -767,7 +813,7 @@ static int smart_stop(void) {
 /* 与 smart_stop 同款"等收尾"语义 */
 static int hold_stop(void) {
     int pid; double t;
-    if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "恒温模式未在运行\n"); return 1; }
+    if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "%s", L("恒温模式未在运行\n", "thermostat is not running\n")); return 1; }
     if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
     for (int i = 0; i < 100; i++) {
         int p; double x;
@@ -777,11 +823,12 @@ static int hold_stop(void) {
     {
         int p; double x;
         if (hold_pid_read(&p, &x) && p == pid) {
-            fprintf(stderr, "恒温模式 10 秒内未完成退出, 请查 /tmp/fansctl.hold.log\n");
+            fprintf(stderr, "%s", L("恒温模式 10 秒内未完成退出, 请查 /tmp/fansctl.hold.log\n",
+                                    "thermostat did not exit within 10 s, check /tmp/fansctl.hold.log\n"));
             return 1;
         }
     }
-    printf("恒温模式已停止(恢复自动)\n");
+    printf("%s", L("恒温模式已停止(恢复自动)\n", "thermostat stopped (auto restored)\n"));
     return 0;
 }
 
@@ -805,7 +852,8 @@ static int hold_loop(double t_set) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGUSR1, on_reload_signal); /* __hold target <°C> 就地更新目标 */
-    printf("恒温模式: 目标最热传感器 %.1f°C, PI 闭环控制; Ctrl+C 退出并恢复自动\n", t_set);
+    printf(L("恒温模式: 目标最热传感器 %.1f°C, PI 闭环控制; Ctrl+C 退出并恢复自动\n",
+             "Thermostat: holding hottest sensor at %.1f°C, PI closed loop; Ctrl+C exits and restores auto\n"), t_set);
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
     double e_prev = 0, t_prev = -999;
@@ -816,7 +864,7 @@ static int hold_loop(double t_set) {
             int p; double nt = 0;
             if (hold_pid_read(&p, &nt) && p == (int)getpid() && nt >= 30 && nt <= 110) {
                 t_set = nt;
-                printf("[目标更新为 %.1f°C]\n", t_set);
+                printf(L("[目标更新为 %.1f°C]\n", "[target updated to %.1f°C]\n"), t_set);
                 fflush(stdout);
             }
         }
@@ -829,7 +877,7 @@ static int hold_loop(double t_set) {
                 if (smc_open() != 0) continue;
                 T = hottest_temp(&tkey);
             }
-            if (T < -999) { fprintf(stderr, "温度读取失败(已重试)\n"); rc = 1; break; }
+            if (T < -999) { fprintf(stderr, "%s", L("温度读取失败(已重试)\n", "temperature read failed (after retries)\n")); rc = 1; break; }
         }
         double Ts = t_prev > -999 ? t_prev + 0.3 * (T - t_prev) : T; /* EMA 平滑 */
         double e = Ts - t_set;
@@ -849,7 +897,8 @@ static int hold_loop(double t_set) {
                 read_rpm_key(f, "Tg", &tg);
                 if ((m >= 0 && m != 1) ||
                     (m == 1 && tg > 0 && last[f] > 0 && fabs(tg - last[f]) > 150)) {
-                    printf("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                    printf(L("[风扇%d 被外部改写(模式=%d 目标=%.0f 期望=%.0f), 重新接管]\n",
+                             "[fan %d overridden externally (mode=%d target=%.0f expected=%.0f), retaking]\n"),
                            f, m, tg, last[f]);
                     fflush(stdout);
                     if (m == 1) last[f] = -1;
@@ -884,13 +933,14 @@ static int hold_loop(double t_set) {
             }
         }
         if (rc != 0) break;
-        printf("[→%.1f°C] %s %.1f°C(平%.1f) 误差%+.1f 趋势%+.2f |",
+        printf(L("[→%.1f°C] %s %.1f°C(平%.1f) 误差%+.1f 趋势%+.2f |",
+                 "[→%.1f°C] %s %.1f°C(avg %.1f) error %+.1f trend %+.2f |"),
                t_set, tkey ? tkey : "?", T, Ts, e, dT);
         for (int f = 0; f < n; f++) {
             double ac = -1;
             read_rpm_key(f, "Ac", &ac);
-            if (manual[f]) printf(" 风扇%d %6.0f→%.0f 手动", f, ac, rpm[f]);
-            else           printf(" 风扇%d %6.0f rpm 自动", f, ac);
+            if (manual[f]) printf(L(" 风扇%d %6.0f→%.0f 手动", " fan %d %6.0f→%.0f manual"), f, ac, rpm[f]);
+            else           printf(L(" 风扇%d %6.0f rpm 自动", " fan %d %6.0f rpm auto"), f, ac);
         }
         printf("\n");
         fflush(stdout);
@@ -901,7 +951,8 @@ static int hold_loop(double t_set) {
         uint64_t dt = cont_ns() - tick_ns;
         tick_ns = cont_ns();
         if (dt > 5ULL * 1000000000ULL) {
-            printf("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n", dt / 1e9);
+            printf(L("[间隔 %.0f 秒, 判定为系统唤醒, 暂交系统控制 5 秒]\n",
+                     "[gap %.0f s, system wake detected, handing control back for 5 s]\n"), dt / 1e9);
             for (int f = 0; f < n; f++)
                 if (manual[f]) {
                     if (fan_auto(f) != 0) { rc = 1; break; }
@@ -918,8 +969,8 @@ static int hold_loop(double t_set) {
     for (int f = 0; f < n; f++)
         if (manual[f]) fan_auto(f);
     if (g_stop) {
-        printf("\n已退出恒温模式, 全部恢复自动");
-        if (g_stop_pid > 0) printf(" (停止信号来自 pid %d)", (int)g_stop_pid);
+        printf("%s", L("\n已退出恒温模式, 全部恢复自动", "\nThermostat exited, all fans restored to auto"));
+        if (g_stop_pid > 0) printf(L(" (停止信号来自 pid %d)", " (stop signal from pid %d)"), (int)g_stop_pid);
         printf("\n");
     }
     return rc;
@@ -931,17 +982,17 @@ static int hold_hidden_cmd(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[2], "stop") == 0) return hold_stop();
     if (argc > 2 && strcmp(argv[2], "target") == 0) {
         /* 更新运行中恒温模式的目标: 改 pidfile + SIGUSR1, 守护进程就地生效 */
-        if (argc < 4) { fprintf(stderr, "用法: __hold target <°C>\n"); return 1; }
+        if (argc < 4) { fprintf(stderr, "%s", L("用法: __hold target <°C>\n", "usage: __hold target <°C>\n")); return 1; }
         double nt = atof(argv[3]);
-        if (nt < 30 || nt > 110) { fprintf(stderr, "目标温度无效\n"); return 1; }
+        if (nt < 30 || nt > 110) { fprintf(stderr, "%s", L("目标温度无效\n", "invalid target temperature\n")); return 1; }
         int pid; double t;
-        if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "恒温模式未在运行\n"); return 1; }
+        if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "%s", L("恒温模式未在运行\n", "thermostat is not running\n")); return 1; }
         FILE *f = fopen(HOLD_PIDFILE, "w");
         if (!f) { perror("pidfile"); return 1; }
         fprintf(f, "%d %.1f\n", pid, nt);
         fclose(f);
         if (kill(pid, SIGUSR1) != 0) { perror("kill"); return 1; }
-        printf("已通知恒温模式更新目标 %.1f°C\n", nt);
+        printf(L("已通知恒温模式更新目标 %.1f°C\n", "thermostat notified: target %.1f°C\n"), nt);
         return 0;
     }
     double t_set = argc > 2 ? atof(argv[2]) : 70;
@@ -994,17 +1045,17 @@ static int smart_hidden_cmd(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[2], "stop") == 0) return smart_stop();
     if (argc > 2 && strcmp(argv[2], "thresh") == 0) {
         /* 更新运行中智能模式的阈值: 改 pidfile + SIGUSR1, 守护进程就地生效 */
-        if (argc < 5) { fprintf(stderr, "用法: __smart thresh <低°C> <高°C>\n"); return 1; }
+        if (argc < 5) { fprintf(stderr, "%s", L("用法: __smart thresh <低°C> <高°C>\n", "usage: __smart thresh <lo°C> <hi°C>\n")); return 1; }
         double nl = atof(argv[3]), nh = atof(argv[4]);
-        if (nl < 20 || nh < nl + 5 || nh > 120) { fprintf(stderr, "阈值无效\n"); return 1; }
+        if (nl < 20 || nh < nl + 5 || nh > 120) { fprintf(stderr, "%s", L("阈值无效\n", "invalid thresholds\n")); return 1; }
         int pid; double lo, hi;
-        if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "智能模式未在运行\n"); return 1; }
+        if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "%s", L("智能模式未在运行\n", "smart mode is not running\n")); return 1; }
         FILE *f = fopen(SMART_PIDFILE, "w");
         if (!f) { perror("pidfile"); return 1; }
         fprintf(f, "%d %.0f %.0f\n", pid, nl, nh);
         fclose(f);
         if (kill(pid, SIGUSR1) != 0) { perror("kill"); return 1; }
-        printf("已通知智能模式更新阈值 %.0f~%.0f°C\n", nl, nh);
+        printf(L("已通知智能模式更新阈值 %.0f~%.0f°C\n", "smart mode notified: thresholds %.0f~%.0f°C\n"), nl, nh);
         return 0;
     }
     double t_lo = argc > 2 ? atof(argv[2]) : 40;
@@ -1030,6 +1081,7 @@ static int smart_hidden_cmd(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    cli_lang_init();
     const char *cmd = argc > 1 ? argv[1] : NULL;
     if (cmd && (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)) {
         printf("fansctl %s\n", FANSCTL_VERSION);
@@ -1052,7 +1104,7 @@ int main(int argc, char **argv) {
         int ok = strcmp(cmd, "__apply") == 0 || strcmp(cmd, "__smart") == 0 ||
                  strcmp(cmd, "__hold") == 0 ||
                  (strcmp(cmd, "smart") == 0 && argc >= 3 && strcmp(argv[2], "stop") == 0);
-        if (!ok) { fprintf(stderr, "setuid 助手只允许风扇操作\n"); return 1; }
+        if (!ok) { fprintf(stderr, "%s", L("setuid 助手只允许风扇操作\n", "setuid helper allows fan operations only\n")); return 1; }
     }
     if (strcmp(cmd, "__apply") == 0) return apply_cmd(argc, argv);
     if (strcmp(cmd, "__smart") == 0) return smart_hidden_cmd(argc, argv);
@@ -1078,18 +1130,20 @@ int main(int argc, char **argv) {
         watch_loop(interval);
     } else if (strcmp(cmd, "set") == 0) {
         if (geteuid() != 0) {
-            fprintf(stderr, "需要 root 权限:  sudo fansctl set <rpm> [风扇号]\n");
+            fprintf(stderr, "%s", L("需要 root 权限:  sudo fansctl set <rpm> [风扇号]\n",
+                                    "root required:  sudo fansctl set <rpm> [fan index]\n"));
             rc = 1;
         } else if (argc < 3) {
-            fprintf(stderr, "用法: fansctl set <rpm> [风扇号]   例: fansctl set 3000\n");
+            fprintf(stderr, "%s", L("用法: fansctl set <rpm> [风扇号]   例: fansctl set 3000\n",
+                                    "usage: fansctl set <rpm> [fan index]   e.g. fansctl set 3000\n"));
             rc = 1;
         } else {
             double rpm = atof(argv[2]);
             int have_idx = argc > 3;
             int idx = have_idx ? atoi(argv[3]) : 0;
             int n = fan_count();
-            if (rpm <= 0) { fprintf(stderr, "无效转速: %s\n", argv[2]); rc = 1; }
-            else if (have_idx && n && (idx < 0 || idx >= n)) { fprintf(stderr, "风扇号 %d 超出范围 (0~%d)\n", idx, n - 1); rc = 1; }
+            if (rpm <= 0) { fprintf(stderr, L("无效转速: %s\n", "invalid RPM: %s\n"), argv[2]); rc = 1; }
+            else if (have_idx && n && (idx < 0 || idx >= n)) { fprintf(stderr, L("风扇号 %d 超出范围 (0~%d)\n", "fan index %d out of range (0~%d)\n"), idx, n - 1); rc = 1; }
             else {
                 int cnt = have_idx ? 1 : (n ? n : 1);
                 for (int i = 0; i < cnt; i++)
@@ -1097,20 +1151,21 @@ int main(int argc, char **argv) {
             }
             if (rc == 0) {
                 usleep(300 * 1000); /* 等 SMC 状态刷新, 否则读到旧值 */
-                printf("已设置:\n");
+                printf("%s", L("已设置:\n", "Applied:\n"));
                 print_status();
             }
         }
     } else if (strcmp(cmd, "max") == 0 || strcmp(cmd, "auto") == 0) {
         int to_max = cmd[0] == 'm';
         if (geteuid() != 0) {
-            fprintf(stderr, "需要 root 权限:  sudo fansctl %s [风扇号]\n", cmd);
+            fprintf(stderr, L("需要 root 权限:  sudo fansctl %s [风扇号]\n",
+                              "root required:  sudo fansctl %s [fan index]\n"), cmd);
             rc = 1;
         } else {
             int have_idx = argc > 2;
             int idx = have_idx ? atoi(argv[2]) : 0;
             int n = fan_count();
-            if (have_idx && n && (idx < 0 || idx >= n)) { fprintf(stderr, "风扇号 %d 超出范围 (0~%d)\n", idx, n - 1); rc = 1; }
+            if (have_idx && n && (idx < 0 || idx >= n)) { fprintf(stderr, L("风扇号 %d 超出范围 (0~%d)\n", "fan index %d out of range (0~%d)\n"), idx, n - 1); rc = 1; }
             else {
                 int cnt = have_idx ? 1 : (n ? n : 1);
                 for (int i = 0; i < cnt; i++) {
@@ -1120,13 +1175,14 @@ int main(int argc, char **argv) {
             }
             if (rc == 0) {
                 usleep(300 * 1000); /* 等 SMC 状态刷新, 否则读到旧值 */
-                printf("%s:\n", to_max ? "已设全速" : "已恢复自动");
+                printf(L("%s:\n", "%s:\n"), to_max ? L("已设全速", "Max speed set") : L("已恢复自动", "Auto restored"));
                 print_status();
             }
         }
     } else if (strcmp(cmd, "smart") == 0) {
         if (geteuid() != 0) {
-            fprintf(stderr, "需要 root 权限:  sudo fansctl smart [低温°C] [高温°C] | stop\n");
+            fprintf(stderr, "%s", L("需要 root 权限:  sudo fansctl smart [低温°C] [高温°C] | stop\n",
+                                    "root required:  sudo fansctl smart [lo°C] [hi°C] | stop\n"));
             rc = 1;
         } else if (argc > 2 && strcmp(argv[2], "stop") == 0) {
             rc = smart_stop();
@@ -1135,10 +1191,12 @@ int main(int argc, char **argv) {
             double t_hi = argc > 3 ? atof(argv[3]) : 80;
             int pid; double a, b;
             if (t_lo < 20 || t_hi < t_lo + 5 || t_hi > 120) {
-                fprintf(stderr, "阈值无效: 需 20 < 低温 且 高温 >= 低温+5 且 高温 <= 120\n");
+                fprintf(stderr, "%s", L("阈值无效: 需 20 < 低温 且 高温 >= 低温+5 且 高温 <= 120\n",
+                                        "invalid thresholds: need 20 < low, high >= low+5, high <= 120\n"));
                 rc = 1;
             } else if (smart_pid_read(&pid, &a, &b)) {
-                fprintf(stderr, "智能模式已在运行 (pid %d, %.0f~%.0f°C), 先 sudo fansctl smart stop\n",
+                fprintf(stderr, L("智能模式已在运行 (pid %d, %.0f~%.0f°C), 先 sudo fansctl smart stop\n",
+                                  "smart mode already running (pid %d, %.0f~%.0f°C), run sudo fansctl smart stop first\n"),
                         pid, a, b);
                 rc = 1;
             } else {
@@ -1151,7 +1209,8 @@ int main(int argc, char **argv) {
         }
     } else if (strcmp(cmd, "hold") == 0) {
         if (geteuid() != 0) {
-            fprintf(stderr, "需要 root 权限:  sudo fansctl hold <目标°C> | stop\n");
+            fprintf(stderr, "%s", L("需要 root 权限:  sudo fansctl hold <目标°C> | stop\n",
+                                    "root required:  sudo fansctl hold <target°C> | stop\n"));
             rc = 1;
         } else if (argc > 2 && strcmp(argv[2], "stop") == 0) {
             rc = hold_stop();
@@ -1159,10 +1218,11 @@ int main(int argc, char **argv) {
             double t_set = argc > 2 ? atof(argv[2]) : 70;
             int hpid; double hx;
             if (t_set < 30 || t_set > 110) {
-                fprintf(stderr, "目标无效: 需 30~110°C\n");
+                fprintf(stderr, "%s", L("目标无效: 需 30~110°C\n", "invalid target: need 30~110°C\n"));
                 rc = 1;
             } else if (hold_pid_read(&hpid, &hx)) {
-                fprintf(stderr, "恒温模式已在运行 (pid %d, →%.1f°C), 先 sudo fansctl hold stop\n",
+                fprintf(stderr, L("恒温模式已在运行 (pid %d, →%.1f°C), 先 sudo fansctl hold stop\n",
+                                  "thermostat already running (pid %d, →%.1f°C), run sudo fansctl hold stop first\n"),
                         hpid, hx);
                 rc = 1;
             } else {
@@ -1174,7 +1234,7 @@ int main(int argc, char **argv) {
             }
         }
     } else {
-        fprintf(stderr,
+        fprintf(stderr, "%s", L(
             "用法: fansctl            启动菜单栏应用(fork 后台, 不占终端)\n"
             "      fansctl <子命令>   命令行模式\n"
             "  fans            风扇转速(只读)\n"
@@ -1191,7 +1251,24 @@ int main(int argc, char **argv) {
             "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
             "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
             "  hold stop       结束恒温模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
-            "  version         版本号\n");
+            "  version         版本号\n",
+            "Usage: fansctl            start the menu-bar app (forks to background)\n"
+            "      fansctl <command>   command line mode\n"
+            "  fans            fan RPMs (read-only)\n"
+            "  status          current/target RPMs and mode\n"
+            "  temps           all temperature sensors\n"
+            "  power           power survey: system draw, input, adapter, USB, top processes\n"
+            "  dump            dump all SMC keys\n"
+            "  watch [sec]     refresh loop\n"
+            "  set <rpm> [N]   set RPM, all fans without N (sudo)\n"
+            "  max [N]         full speed, all fans without N (sudo)\n"
+            "  auto [N]        back to automatic, all fans without N (sudo)\n"
+            "  smart [lo hi]   smart curve, default 40~80°C (sudo)\n"
+            "  smart stop      stop smart mode (incl. menu-bar instances), restore auto (sudo)\n"
+            "  hold <°C>       thermostat: PI loop holds the hottest sensor at target,\n"
+            "                  default 70°C; mutually exclusive with smart (sudo)\n"
+            "  hold stop       stop thermostat (incl. menu-bar instances), restore auto (sudo)\n"
+            "  version         print version\n"));
         smc_close();
         return 1;
     }

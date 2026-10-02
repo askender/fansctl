@@ -5,8 +5,10 @@
 macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 **一个程序两种形态**: 无参数 = 菜单栏应用(自动进后台, 不占终端); 带参数 = CLI。
 零第三方依赖, 只链系统框架 (IOKit / CoreFoundation / AppKit / Security)。
-菜单栏界面中英双语(跟系统语言, 菜单可切换); CLI 输出与日志目前为中文。
-版本: `fansctl version` (当前 1.3.0)。
+菜单栏界面中英双语(跟系统语言, 菜单可切换); CLI 同样跟随系统语言
+(`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`, 可用 `FANSCTL_LANG=zh|en` 强制)。
+守护进程日志 (/tmp/fansctl.smart.log 等) 恒为中文, 保证可 grep。
+版本: `fansctl version` (当前 1.4.0)。
 
 ## 构建与安装
 
