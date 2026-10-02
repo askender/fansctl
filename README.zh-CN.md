@@ -42,6 +42,11 @@ sudo fansctl hold stop       结束恒温模式(含菜单栏启动的)
 
 ## 菜单栏
 
+<p align="center">
+  <img src="img/menu-zh.png" width="310" alt="fansctl 菜单 (中文)">
+  <img src="img/menu-en.png" width="340" alt="fansctl menu (English)">
+</p>
+
 - 状态栏标题: `最热°C|最大转速(krpm)`, 2 秒刷新
 - 下拉第一行: 最热传感器/曲线%或恒温目标 + 机器功率 (SMC 键 `PSTR`,
   与 ioreg SystemPowerIn 同源; 无此键的机器自动隐藏)。充电时扣除

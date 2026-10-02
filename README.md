@@ -53,6 +53,11 @@ sudo fansctl hold stop       stop thermostat mode (incl. menu-bar instances)
 
 ## Menu bar
 
+<p align="center">
+  <img src="img/menu-en.png" width="340" alt="fansctl menu (English)">
+  <img src="img/menu-zh.png" width="310" alt="fansctl 菜单 (中文)">
+</p>
+
 - Status item: `hottest°C|max rpm (krpm)`, refreshed every 2 s
 - First row: hottest sensor / curve % or thermostat target + system power draw
   (SMC key `PSTR`, same source as ioreg SystemPowerIn; auto-hidden on machines
