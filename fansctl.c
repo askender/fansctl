@@ -7,11 +7,18 @@
  * 许可证: AGPL-3.0-or-later (见 LICENSE), 商用需开源衍生代码
  */
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
 #include <sys/sysctl.h>
 #include <sys/proc_info.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <libproc.h>
+#include <limits.h>
 #include "fansctl.h"
 
 /* ==================== CLI 双语 (跟随系统语言) ====================
@@ -29,6 +36,9 @@ static void cli_lang_init(void) {
     if (!v || !*v) v = getenv("LANG");
     g_lang_en = (v && *v && strncmp(v, "zh", 2) != 0);
 }
+
+/* --json: fans/status/temps/power/watch 的机器可读输出, 键名固定英文与界面语言无关 */
+static int g_json;
 
 /* ==================== 写入/控制 (需要 root) ==================== */
 
@@ -286,6 +296,114 @@ static void print_status_line(void) {
     printf("\n");
 }
 
+/* ==================== JSON 输出 (--json) ==================== */
+
+/* 字符串转义 (UTF-8 原样透传, 只转义 JSON 语法字符与控制字符) */
+static void json_str(const char *s) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\b': fputs("\\b", stdout); break;
+        case '\f': fputs("\\f", stdout); break;
+        case '\n': fputs("\\n", stdout); break;
+        case '\r': fputs("\\r", stdout); break;
+        case '\t': fputs("\\t", stdout); break;
+        default:
+            if (*p < 0x20) printf("\\u%04x", *p);
+            else putchar(*p);
+        }
+    }
+    putchar('"');
+}
+
+/* 数值打 null 或数字: 未知约定为 -1, 其余按精度输出 (电流这类合法负数字段不用此函数) */
+static void jnum(double v, int prec) {
+    if (v <= -0.5) fputs("null", stdout);
+    else printf("%.*f", prec, v);
+}
+
+static void json_fans(void) {
+    printf("{\"fans\":[");
+    int first = 1;
+    for (char c = '0'; c <= '9'; c++) {
+        char k[5];
+        snprintf(k, sizeof(k), "F%cAc", c);
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) != 0) continue;
+        char km[5], kx[5], kid[5];
+        snprintf(km, sizeof(km), "F%cMn", c);
+        snprintf(kx, sizeof(kx), "F%cMx", c);
+        snprintf(kid, sizeof(kid), "F%cID", c);
+        double mn = -1, mx = -1;
+        read_key_value(km, NULL, &mn, NULL);
+        read_key_value(kx, NULL, &mx, NULL);
+        char id[32] = ""; UInt8 idbuf[32]; size_t idlen = sizeof(idbuf);
+        if (smc_read_key(kid, idbuf, &idlen, NULL) == KERN_SUCCESS && idlen > 0) {
+            size_t keep = idlen < sizeof(id) - 1 ? idlen : sizeof(id) - 1;
+            memcpy(id, idbuf, keep); id[keep] = 0;
+        }
+        printf("%s{\"id\":%c", first ? "" : ",", c);
+        if (id[0]) { printf(",\"name\":"); json_str(id); }
+        printf(",\"rpm\":");       jnum(v, 0);
+        printf(",\"min_rpm\":");   jnum(mn, 0);
+        printf(",\"max_rpm\":");   jnum(mx, 0);
+        printf("}");
+        first = 0;
+    }
+    printf("]}\n");
+}
+
+static void json_status(void) {
+    int n = fan_count();
+    printf("{\"fans\":[");
+    int first = 1;
+    for (int i = 0; i < (n > 0 ? n : 10); i++) {
+        if (n <= 0) { /* FNum 不可读: 退回逐个探测 F?Ac, 与人类输出一致 */
+            char k[5];
+            snprintf(k, sizeof(k), "F%dAc", i);
+            if (!key_exists(k)) continue;
+        }
+        double ac = -1, tg = -1, mn = -1, mx = -1;
+        read_rpm_key(i, "Ac", &ac);
+        read_rpm_key(i, "Tg", &tg);
+        read_rpm_key(i, "Mn", &mn);
+        read_rpm_key(i, "Mx", &mx);
+        int mode = fan_mode(i);
+        printf("%s{\"id\":%d,\"actual_rpm\":", first ? "" : ",", i);
+        jnum(ac, 0);
+        printf(",\"target_rpm\":");
+        jnum(tg, 0);
+        printf(",\"min_rpm\":");
+        jnum(mn, 0);
+        printf(",\"max_rpm\":");
+        jnum(mx, 0);
+        printf(",\"mode\":\"%s\"}",
+               mode == 1 ? "manual" : mode == 0 ? "auto" : "unknown");
+        first = 0;
+    }
+    printf("]}\n");
+}
+
+static void json_temps(void) {
+    UInt32 n = total_keys();
+    printf("{\"temps\":[");
+    int first = 1;
+    if (n)
+        for (UInt32 i = 0; i < n; i++) {
+            char k[5];
+            if (get_key_at(i, k) != 0) continue;
+            if (k[0] != 'T') continue;
+            double v;
+            if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
+                printf("%s{\"key\":\"%s\",\"celsius\":%.2f}", first ? "" : ",", k, v);
+                first = 0;
+            }
+        }
+    printf("]}\n");
+}
+
 /* ==================== 智能模式 (需 root, Ctrl+C 退出并恢复自动) ==================== */
 
 static volatile sig_atomic_t g_stop = 0;
@@ -450,7 +568,8 @@ static int smart_loop(double t_lo, double t_hi) {
 
 static void watch_loop(int interval) {
     for (;;) {
-        print_status_line();
+        if (g_json) json_status(); /* 每拍一个完整 JSON 对象 (JSONL) */
+        else print_status_line();
         fflush(stdout);
         sleep(interval);
     }
@@ -486,17 +605,19 @@ static int usb_declared_ma(io_object_t service, int bcd_usb, int *self_powered) 
     return ma;
 }
 
-static void print_usb_power(void) {
+/* USB 枚举采集: 供人类输出与 --json 共用, 返回条数 (数组调用方 free), 失败 -1 */
+struct usb_dev { char name[128], vendor[128]; const char *speed; int ma; int self_powered; };
+
+static int collect_usb(struct usb_dev **out) {
     io_iterator_t it = MACH_PORT_NULL;
-    printf("%s", L("USB 设备 (声明的 5V 电流需求, 非实测):\n",
-                   "USB devices (declared 5V current draw, not measured):\n"));
+    *out = NULL;
     if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                                     IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS) {
-        printf("%s", L("  枚举失败\n", "  enumeration failed\n"));
-        return;
-    }
+                                     IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS)
+        return -1;
+    int cap = 8, n = 0;
+    struct usb_dev *list = calloc((size_t)cap, sizeof *list);
+    if (!list) { IOObjectRelease(it); return -1; }
     io_object_t dev;
-    int n = 0;
     while ((dev = IOIteratorNext(it)) != 0) {
         CFMutableDictionaryRef props = NULL;
         if (IORegistryEntryCreateCFProperties(dev, &props,
@@ -522,20 +643,44 @@ static void print_usb_power(void) {
             }
             int selfp = 0;
             int ma = usb_declared_ma(dev, bcd > 0 ? (int)bcd : 0, &selfp);
-            if (ma > 0)
-                printf(L("  - %s (%s)  %s  %d mA ≈ %.1f W%s\n", "  - %s (%s)  %s  %d mA ≈ %.1f W%s\n"),
-                       name, vendor, sp, ma, ma * 5.0 / 1000.0,
-                       selfp ? L(" [自供电]", " [self-powered]") : "");
-            else
-                printf(L("  - %s (%s)  %s  电流未知\n", "  - %s (%s)  %s  current unknown\n"),
-                       name, vendor, sp);
+            if (n == cap) {
+                cap *= 2;
+                struct usb_dev *grown = realloc(list, (size_t)cap * sizeof *list);
+                if (!grown) { free(list); CFRelease(props); IOObjectRelease(dev); IOObjectRelease(it); return -1; }
+                list = grown;
+            }
+            snprintf(list[n].name, sizeof list[n].name, "%s", name);
+            snprintf(list[n].vendor, sizeof list[n].vendor, "%s", vendor);
+            list[n].speed = sp;
+            list[n].ma = ma;
+            list[n].self_powered = selfp;
             n++;
         }
         CFRelease(props);
         IOObjectRelease(dev);
     }
     IOObjectRelease(it);
+    *out = list;
+    return n;
+}
+
+static void print_usb_power(void) {
+    printf("%s", L("USB 设备 (声明的 5V 电流需求, 非实测):\n",
+                   "USB devices (declared 5V current draw, not measured):\n"));
+    struct usb_dev *d = NULL;
+    int n = collect_usb(&d);
+    if (n < 0) { printf("%s", L("  枚举失败\n", "  enumeration failed\n")); return; }
+    for (int i = 0; i < n; i++) {
+        if (d[i].ma > 0)
+            printf(L("  - %s (%s)  %s  %d mA ≈ %.1f W%s\n", "  - %s (%s)  %s  %d mA ≈ %.1f W%s\n"),
+                   d[i].name, d[i].vendor, d[i].speed, d[i].ma, d[i].ma * 5.0 / 1000.0,
+                   d[i].self_powered ? L(" [自供电]", " [self-powered]") : "");
+        else
+            printf(L("  - %s (%s)  %s  电流未知\n", "  - %s (%s)  %s  current unknown\n"),
+                   d[i].name, d[i].vendor, d[i].speed);
+    }
     if (!n) printf("%s", L("  (无 USB 设备)\n", "  (no USB devices)\n"));
+    free(d);
 }
 
 /* ---- 进程功耗排行: 瞬时 CPU% (0.4s 两次采样) + 平均% (累计÷存活时长) + 内存, 降序 ----
@@ -645,7 +790,9 @@ static int denied_cmp(const void *x, const void *y) {
     return a < b ? 1 : a > b ? -1 : 0;
 }
 
-static void print_top_procs(void) {
+/* 两次采样 + 匹配 + 排序, 供人类输出与 --json 共用。
+   返回行数 (rows 按 CPU% 降序; denied 为无权限进程, 调用方 free 两个数组), 失败 -1 */
+static int gather_top(struct top_row **rows_out, struct proc_sample **denied_out, int *ndenied_out) {
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
     struct proc_sample *a = NULL, *b = NULL, *da = NULL, *db = NULL;
@@ -656,12 +803,9 @@ static void print_top_procs(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double elapsed_ns =
         (double)(ts1.tv_sec - ts0.tv_sec) * 1e9 + (double)(ts1.tv_nsec - ts0.tv_nsec);
-    printf("%s", L("功耗 Top 进程 (按瞬时 CPU% 降序; 平均%=启动以来累计÷存活时长; GPU 无公开数据):\n",
-                   "Top power processes (by instantaneous CPU%, desc; avg% = cumulative÷lifetime; no public GPU data):\n"));
     if (na <= 0 || nb <= 0 || elapsed_ns <= 0) {
-        printf("%s", L("  枚举失败\n", "  enumeration failed\n"));
         free(a); free(b); free(da); free(db);
-        return;
+        return -1;
     }
     uint64_t memsize = 0;
     size_t ml = sizeof memsize;
@@ -670,7 +814,7 @@ static void print_top_procs(void) {
     clock_gettime(CLOCK_REALTIME, &rt);
     double now_s = rt.tv_sec + rt.tv_nsec / 1e9;
     struct top_row *rows = calloc((size_t)nb, sizeof *rows);
-    if (!rows) { printf("%s", L("  内存不足\n", "  out of memory\n")); free(a); free(b); free(da); free(db); return; }
+    if (!rows) { free(a); free(b); free(da); free(db); return -1; }
     int n = 0;
     for (int j = 0; j < nb; j++)
         for (int i = 0; i < na; i++)
@@ -691,6 +835,24 @@ static void print_top_procs(void) {
                 break;
             }
     qsort(rows, (size_t)n, sizeof *rows, row_cmp);
+    free(a); free(b); free(da); /* db 转交调用方 */
+    *rows_out = rows;
+    *denied_out = db;
+    *ndenied_out = ndb;
+    return n;
+}
+
+static void print_top_procs(void) {
+    printf("%s", L("功耗 Top 进程 (按瞬时 CPU% 降序; 平均%=启动以来累计÷存活时长; GPU 无公开数据):\n",
+                   "Top power processes (by instantaneous CPU%, desc; avg% = cumulative÷lifetime; no public GPU data):\n"));
+    struct top_row *rows = NULL;
+    struct proc_sample *db = NULL;
+    int ndb = 0;
+    int n = gather_top(&rows, &db, &ndb);
+    if (n < 0) {
+        printf("%s", L("  枚举失败\n", "  enumeration failed\n"));
+        return;
+    }
     fputs("  ", stdout);
     hdr_cell("PID", 6);                 /* 对应 %6d */
     hdr_cell("CPU", 6);                 /* %5.1f%% */
@@ -723,7 +885,7 @@ static void print_top_procs(void) {
             printf("%s%s", i ? "," : " ", db[i].name);
         printf("\n");
     }
-    free(rows); free(a); free(b); free(da); free(db);
+    free(rows); free(db);
 }
 
 static int power_cmd(void) {
@@ -778,6 +940,62 @@ static int power_cmd(void) {
     print_usb_power();
     print_top_procs();
     return 0;
+}
+
+static void json_power(void) {
+    struct power_info p;
+    int has_batt = power_read(&p) == 0;
+    double pw = -1;
+    read_key_value("PSTR", NULL, &pw, NULL);
+    printf("{\"system_w\":");          /* PSTR, 充电时含充电分量 (battery.charge_w 可拆出) */
+    if (pw > 0 && pw < 1000) printf("%.1f", pw); else fputs("null", stdout);
+    if (p.sys_v > 0 && p.sys_i > 0) {  /* 输入遥测 (约分钟级刷新) */
+        double w = p.sys_w > 0 ? p.sys_w : p.sys_v * p.sys_i;
+        printf(",\"input\":{\"voltage_v\":%.1f,\"current_a\":%.2f,\"watts\":%.1f}",
+               p.sys_v, p.sys_i, w);
+    }
+    if (p.adapter_w > 0) {
+        printf(",\"adapter\":{\"rated_w\":%d", p.adapter_w);
+        if (p.adapter_v > 0) printf(",\"negotiated_v\":%d", p.adapter_v);
+        printf("}");
+    }
+    printf(",\"external_power\":%s", p.ext ? "true" : "false");
+    if (has_batt)
+        printf(",\"battery\":{\"present\":true,\"charging\":%s,\"voltage_v\":%.2f,"
+               "\"current_ma\":%.0f,\"charge_w\":%.1f}",
+               p.charging ? "true" : "false", p.batt_v, p.batt_a, p.charge_w);
+    else
+        printf(",\"battery\":{\"present\":false}");
+    struct usb_dev *usb = NULL;
+    int nusb = collect_usb(&usb);
+    if (nusb < 0) nusb = 0;
+    printf(",\"usb\":[");
+    for (int i = 0; i < nusb; i++) {
+        if (i) putchar(',');
+        printf("{\"name\":"); json_str(usb[i].name);
+        printf(",\"vendor\":"); json_str(usb[i].vendor);
+        printf(",\"speed\":\"%s\"", usb[i].speed);
+        if (usb[i].ma > 0) printf(",\"declared_ma\":%d", usb[i].ma);
+        printf(",\"self_powered\":%s}", usb[i].self_powered ? "true" : "false");
+    }
+    printf("]");
+    free(usb);
+    struct top_row *rows = NULL;
+    struct proc_sample *db = NULL;
+    int ndb = 0;
+    int n = gather_top(&rows, &db, &ndb);
+    printf(",\"top_processes\":[");
+    for (int i = 0; i < n && i < 10 && rows[i].cpu >= 0.1; i++) {
+        if (i) putchar(',');
+        printf("{\"pid\":%d,\"name\":", rows[i].pid);
+        json_str(rows[i].name);
+        printf(",\"cpu_pct\":%.1f,\"avg_pct\":%.1f,\"total_cpu_s\":%.1f,"
+               "\"memory_mb\":%.1f,\"mem_pct\":%.1f}",
+               rows[i].cpu, rows[i].avg, rows[i].cpu_ns / 1e9,
+               rows[i].rss / 1048576.0, rows[i].mempct);
+    }
+    printf("],\"unprivileged_processes\":%d}\n", ndb);
+    free(rows); free(db);
 }
 
 /* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
@@ -1080,6 +1298,291 @@ static int smart_hidden_cmd(int argc, char **argv) {
     return rc;
 }
 
+/* ==================== 菜单栏 LaunchAgent 管理 (bar install/uninstall/status) ==================== */
+
+#define BAR_LABEL   "local.fansctl.bar"
+#define BAR_PIDFILE "/tmp/fansctl.bar.pid"
+
+/* 自身可执行文件绝对路径 (过 realpath 解符号链接: brew 的 bin/ 是链到 Cellar 的) */
+static int self_path(char out[PATH_MAX]) {
+    char raw[PATH_MAX];
+    uint32_t size = sizeof raw;
+    if (_NSGetExecutablePath(raw, &size) != 0) return -1;
+    return realpath(raw, out) ? 0 : -1;
+}
+
+static int run_launchctl(char *const args[], int quiet) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (quiet) {
+            int fd = open("/dev/null", O_WRONLY);
+            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        }
+        execv("/bin/launchctl", args);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    if (g_debug) fprintf(stderr, "[dbg] launchctl %s %s -> rc=%d\n", args[1], args[2], rc);
+    return rc;
+}
+
+static void xml_esc(FILE *f, const char *s) {
+    for (; *s; s++) {
+        if (*s == '&')      fputs("&amp;", f);
+        else if (*s == '<') fputs("&lt;", f);
+        else if (*s == '>') fputs("&gt;", f);
+        else                fputc(*s, f);
+    }
+}
+
+/* 从 plist 文本里取 ProgramArguments 的第一个 <string> (我们只写这一种结构, 轻量解析够用) */
+static void plist_prog(const char *plist, char *out, size_t n) {
+    out[0] = 0;
+    FILE *f = fopen(plist, "r");
+    if (!f) return;
+    char buf[2048];
+    size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = 0;
+    char *pa = strstr(buf, "<key>ProgramArguments</key>");
+    if (!pa) return;
+    char *s = strstr(pa, "<string>");
+    if (!s) return;
+    s += 8;
+    char *e = strstr(s, "</string>");
+    if (!e) return;
+    size_t len = (size_t)(e - s) < n - 1 ? (size_t)(e - s) : n - 1;
+    memcpy(out, s, len);
+    out[len] = 0;
+}
+
+static int bar_cmd(int argc, char **argv) {
+    const char *sub = argc > 2 ? argv[2] : "";
+    const char *home = getenv("HOME");
+    if (!home || !*home) { fprintf(stderr, "%s", L("无 HOME 环境\n", "no HOME environment\n")); return 1; }
+    if (geteuid() == 0) {
+        fprintf(stderr, "%s", L("bar 子命令无需 sudo — 它管理的是当前用户的 LaunchAgent\n",
+                                "the bar subcommand needs no sudo — it manages the current user's LaunchAgent\n"));
+        return 1;
+    }
+    char plist[PATH_MAX];
+    snprintf(plist, sizeof plist, "%s/Library/LaunchAgents/%s.plist", home, BAR_LABEL);
+    char domain[32];
+    snprintf(domain, sizeof domain, "gui/%d", (int)getuid());
+    /* bootout/print 用连写 service-target 形式 (gui/uid/label): 本机实测
+       macOS 15 的 bootout 两参数空格形式恒报 EIO(5), 连写形式正常 */
+    char target[64];
+    snprintf(target, sizeof target, "gui/%d/%s", (int)getuid(), BAR_LABEL);
+    char *bootout[]   = {(char *)"launchctl", (char *)"bootout",   target, NULL};
+    char *bootstrap[] = {(char *)"launchctl", (char *)"bootstrap", domain, plist, NULL};
+    char *printc[]    = {(char *)"launchctl", (char *)"print",     target, NULL};
+
+    if (strcmp(sub, "install") == 0) {
+        char exe[PATH_MAX];
+        if (self_path(exe) != 0) { fprintf(stderr, "%s", L("无法定位自身路径\n", "cannot resolve own path\n")); return 1; }
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/Library/LaunchAgents", home);
+        mkdir(dir, 0755); /* 已存在则 EEXIST, 忽略 */
+        FILE *f = fopen(plist, "w");
+        if (!f) { perror(plist); return 1; }
+        fprintf(f,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\">\n<dict>\n"
+            "\t<key>Label</key><string>%s</string>\n"
+            "\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>", BAR_LABEL);
+        xml_esc(f, exe);
+        fprintf(f, "</string>\n\t</array>\n"
+            "\t<key>RunAtLoad</key><true/>\n"
+            "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key><false/>\n\t</dict>\n"
+            "\t<key>StandardOutPath</key><string>/tmp/fansctl.bar.log</string>\n"
+            "\t<key>StandardErrorPath</key><string>/tmp/fansctl.bar.log</string>\n"
+            "</dict>\n</plist>\n");
+        fclose(f);
+        chmod(plist, 0644);
+        /* 已加载的旧实例先按旧配置退场, 再以新 plist 拉起 (幂等重装)。
+           bootout 异步收尾, 立即 bootstrap 会撞 EIO(5): 等 print 查不到为止 */
+        run_launchctl(bootout, 1);
+        for (int i = 0; i < 30; i++) {
+            if (run_launchctl(printc, 1) != 0) break;
+            usleep(100 * 1000);
+        }
+        if (run_launchctl(bootstrap, 0) != 0) {
+            fprintf(stderr, "%s", L("launchctl bootstrap 失败\n", "launchctl bootstrap failed\n"));
+            return 1;
+        }
+        printf(L("已安装并启动菜单栏:\n  %s\n  程序 %s\n  日志 /tmp/fansctl.bar.log (登录自启, 异常退出自动拉起)\n",
+                 "Menu-bar app installed and started:\n  %s\n  program %s\n  log /tmp/fansctl.bar.log (starts at login, auto-restarted on crash)\n"),
+               plist, exe);
+        return 0;
+    }
+    if (strcmp(sub, "uninstall") == 0) {
+        run_launchctl(bootout, 1); /* 未加载也无妨 */
+        if (unlink(plist) != 0 && errno != ENOENT) { perror(plist); return 1; }
+        printf("%s", L("已卸载: 菜单栏停止, LaunchAgent 已移除\n",
+                       "Uninstalled: menu-bar app stopped, LaunchAgent removed\n"));
+        return 0;
+    }
+    if (strcmp(sub, "status") == 0) {
+        int has_plist = access(plist, F_OK) == 0;
+        printf(L("开机自启: %s\n  %s\n", "Auto-start: %s\n  %s\n"),
+               has_plist ? L("已安装", "installed") : L("未安装 (fansctl bar install 可装)",
+                                                        "not installed (see fansctl bar install)"), plist);
+        if (has_plist) {
+            char prog[PATH_MAX] = "";
+            plist_prog(plist, prog, sizeof prog);
+            if (prog[0])
+                printf(L("  程序 %s%s\n", "  program %s%s\n"), prog,
+                       access(prog, X_OK) == 0 ? "" : L(" (文件不存在!)", " (missing!)"));
+            int rc = run_launchctl(printc, 1);
+            printf(L("launchd: %s\n", "launchd: %s\n"),
+                   rc == 0 ? L("已加载", "loaded") : L("未加载", "not loaded"));
+            FILE *pf = fopen(BAR_PIDFILE, "r");
+            int pid = 0, alive = 0;
+            if (pf) {
+                if (fscanf(pf, "%d", &pid) == 1 && pid > 0 && kill(pid, 0) == 0) alive = 1;
+                fclose(pf);
+            }
+            if (alive)
+                printf(L("菜单栏进程: 运行中 (pid %d)\n", "Menu-bar process: running (pid %d)\n"), pid);
+            else
+                printf("%s", L("菜单栏进程: 未运行\n", "Menu-bar process: not running\n"));
+        }
+        return 0;
+    }
+    fprintf(stderr, "%s", L("用法: fansctl bar install|uninstall|status\n",
+                            "usage: fansctl bar install|uninstall|status\n"));
+    return 1;
+}
+
+/* ==================== 诊断 (doctor): 报 issue 时附上, 免来回追问 ==================== */
+
+static void sysctl_str(const char *name, char *out, size_t n) {
+    out[0] = 0;
+    sysctlbyname(name, out, &n, NULL, 0); /* 失败留空串 */
+}
+
+static int doctor_cmd(void) {
+    printf("fansctl %s\n", FANSCTL_VERSION);
+    char model[64] = "", chip[128] = "", osv[32] = "", osb[32] = "";
+    struct utsname u;
+    memset(&u, 0, sizeof u);
+    uname(&u);
+    sysctl_str("hw.model", model, sizeof model);
+    sysctl_str("machdep.cpu.brand_string", chip, sizeof chip);
+    sysctl_str("kern.osproductversion", osv, sizeof osv);
+    sysctl_str("kern.osversion", osb, sizeof osb);
+    printf(L("系统: %s  芯片 %s  macOS %s (%s)  %s\n",
+             "System: %s  chip %s  macOS %s (%s)  %s\n"),
+           model, chip, osv, osb, u.machine);
+
+    if (smc_open() == 0) {
+        printf(L("AppleSMC: 可用, %u 个键\n", "AppleSMC: available, %u keys\n"), total_keys());
+        int n = fan_count();
+        if (n > 0) {
+            printf(L("风扇: %d 个\n", "Fans: %d\n"), n);
+            for (int i = 0; i < n; i++) {
+                double ac = -1, mn = -1, mx = -1;
+                read_rpm_key(i, "Ac", &ac);
+                read_rpm_key(i, "Mn", &mn);
+                read_rpm_key(i, "Mx", &mx);
+                char md[5];
+                int have_md = fan_md_key(i, md);
+                int mode = fan_mode(i);
+                printf(L("  风扇%d: 当前 %.0f rpm  范围 %.0f~%.0f  模式键 %s  模式 %s\n",
+                         "  fan %d: current %.0f rpm  range %.0f~%.0f  mode key %s  mode %s\n"),
+                       i, ac, mn, mx, have_md ? md : "-",
+                       mode == 1 ? L("手动", "manual") : mode == 0 ? L("自动", "auto") : L("未知", "unknown"));
+            }
+        } else {
+            printf("%s", L("风扇: 未发现 (FNum 不可读)\n", "Fans: none found (FNum unreadable)\n"));
+        }
+        scan_temp_keys();
+        const char *hk = NULL;
+        double ht = hottest_temp(&hk);
+        if (g_tkey_n > 0)
+            printf(L("温度传感器: %d 个, 最热 %s %.1f°C\n",
+                     "Temperature sensors: %d, hottest %s %.1f°C\n"),
+                   g_tkey_n, hk ? hk : "?", ht);
+        else
+            printf("%s", L("温度传感器: 未发现\n", "Temperature sensors: none found\n"));
+        printf(L("PSTR (机器功率键): %s\n", "PSTR (system power key): %s\n"),
+               key_exists("PSTR") ? L("存在", "present") : L("不存在", "absent"));
+        printf(L("Ftst (手动模式解锁键): %s\n", "Ftst (manual-mode unlock key): %s\n"),
+               key_exists("Ftst") ? L("存在", "present") : L("不存在", "absent"));
+        smc_close();
+    } else {
+        printf("%s", L("AppleSMC: 不可用 (虚拟机或无 SMC 的机型), 风扇功能不可用\n",
+                       "AppleSMC: unavailable (VM or a machine without SMC), fan control unavailable\n"));
+    }
+
+    struct stat hst;
+    if (stat("/usr/local/bin/fansctl-root", &hst) == 0) {
+        int suid = (hst.st_mode & S_ISUID) != 0;
+        printf(L("root 助手: 已安装, setuid=%s\n",
+                 "root helper: installed, setuid=%s\n"),
+               suid ? L("是 (菜单栏免密控制)", "yes (passwordless control from the menu bar)")
+                    : L("否 (重装: make install-root)", "no (reinstall: make install-root)"));
+    } else {
+        printf("%s", L("root 助手: 未安装 (菜单栏控制将每次弹密码框; make install-root 可装)\n",
+                       "root helper: not installed (menu bar prompts for a password each time; make install-root)\n"));
+    }
+
+    char plist[PATH_MAX];
+    const char *home = getenv("HOME");
+    snprintf(plist, sizeof plist, "%s/Library/LaunchAgents/%s.plist",
+             (home && *home) ? home : "", BAR_LABEL);
+    int has_plist = access(plist, F_OK) == 0;
+    printf(L("开机自启 (LaunchAgent): %s\n", "Auto-start (LaunchAgent): %s\n"),
+           has_plist ? L("已安装", "installed")
+                     : L("未安装 (fansctl bar install 可装)", "not installed (see fansctl bar install)"));
+    if (has_plist) {
+        char prog[PATH_MAX] = "";
+        plist_prog(plist, prog, sizeof prog);
+        if (prog[0])
+            printf(L("  程序 %s%s\n", "  program %s%s\n"), prog,
+                   access(prog, X_OK) == 0 ? "" : L(" (文件不存在!)", " (missing!)"));
+    }
+
+    int pid;
+    double a, b, t;
+    if (smart_pid_read(&pid, &a, &b))
+        printf(L("智能模式: 运行中 (pid %d, %.0f~%.0f°C)\n",
+                 "Smart mode: running (pid %d, %.0f~%.0f°C)\n"), pid, a, b);
+    else
+        printf("%s", L("智能模式: 未运行\n", "Smart mode: not running\n"));
+    if (hold_pid_read(&pid, &t))
+        printf(L("恒温模式: 运行中 (pid %d, →%.1f°C)\n",
+                 "Thermostat: running (pid %d, →%.1f°C)\n"), pid, t);
+    else
+        printf("%s", L("恒温模式: 未运行\n", "Thermostat: not running\n"));
+
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                   IOServiceMatching("AppleSmartBattery"));
+    if (svc) {
+        CFMutableDictionaryRef props = NULL;
+        if (IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, kNilOptions) == KERN_SUCCESS && props) {
+            double cyc = cfnum_to_double(CFDictionaryGetValue(props, CFSTR("CycleCount")));
+            CFTypeRef x = CFDictionaryGetValue(props, CFSTR("ExternalConnected"));
+            int ext = (x && x == kCFBooleanTrue);
+            if (cyc >= 0)
+                printf(L("电池: 有, 循环 %.0f 次, %s\n", "Battery: present, %.0f cycles, %s\n"),
+                       cyc, ext ? L("外接电源", "on AC power") : L("电池供电", "on battery"));
+            else
+                printf("%s", L("电池: 有 (循环数未知)\n", "Battery: present (cycle count unknown)\n"));
+            CFRelease(props);
+        }
+        IOObjectRelease(svc);
+    } else {
+        printf("%s", L("电池: 无 (台式机)\n", "Battery: none (desktop)\n"));
+    }
+    printf("%s", L("提交 issue 请附上以上全部输出。\n",
+                   "Please attach this full output when filing an issue.\n"));
+    return 0;
+}
 /* 用法输出 — 不依赖 SMC: 无 AppleSMC 的环境 (如 CI 虚拟机) 敲错命令也能看到帮助 */
 static void print_usage(void) {
     fprintf(stderr, "%s", L(
@@ -1091,6 +1594,7 @@ static void print_usage(void) {
         "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
         "  dump            导出全部 SMC 键\n"
         "  watch [秒]      循环刷新\n"
+        "  (--json)        fans/status/temps/power/watch 的机器可读输出 (watch 每行一个)\n"
         "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
         "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
         "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
@@ -1099,6 +1603,10 @@ static void print_usage(void) {
         "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
         "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
         "  hold stop       结束恒温模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
+        "  bar install     安装菜单栏开机自启 (LaunchAgent, 无需 sudo)\n"
+        "  bar uninstall   移除开机自启并停止菜单栏\n"
+        "  bar status      查看自启安装与运行状态\n"
+        "  doctor          收集诊断信息 (报 issue 请附输出)\n"
         "  version         版本号\n",
         "Usage: fansctl            start the menu-bar app (forks to background)\n"
         "      fansctl <command>   command line mode\n"
@@ -1108,6 +1616,7 @@ static void print_usage(void) {
         "  power           power survey: system draw, input, adapter, USB, top processes\n"
         "  dump            dump all SMC keys\n"
         "  watch [sec]     refresh loop\n"
+        "  (--json)        machine-readable JSON for fans/status/temps/power/watch (one object per line for watch)\n"
         "  set <rpm> [N]   set RPM, all fans without N (sudo)\n"
         "  max [N]         full speed, all fans without N (sudo)\n"
         "  auto [N]        back to automatic, all fans without N (sudo)\n"
@@ -1116,6 +1625,10 @@ static void print_usage(void) {
         "  hold <°C>       thermostat: PI loop holds the hottest sensor at target,\n"
         "                  default 70°C; mutually exclusive with smart (sudo)\n"
         "  hold stop       stop thermostat (incl. menu-bar instances), restore auto (sudo)\n"
+        "  bar install     install the menu-bar auto-start LaunchAgent (no sudo)\n"
+        "  bar uninstall   remove auto-start and stop the menu bar\n"
+        "  bar status      show auto-start installation and run status\n"
+        "  doctor          collect diagnostics (attach when filing issues)\n"
         "  version         print version\n"));
 }
 
@@ -1150,6 +1663,18 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "__hold") == 0) return hold_hidden_cmd(argc, argv);
     if (strcmp(cmd, "__ask") == 0) return ask_main(argc, argv);
     g_debug = getenv("FANSCTL_DEBUG") != NULL;
+    if (strcmp(cmd, "bar") == 0) return bar_cmd(argc, argv);       /* 不碰 SMC */
+    if (strcmp(cmd, "doctor") == 0) return doctor_cmd();           /* SMC 可选, 自行容错 */
+
+
+    for (int i = 2; i < argc; i++)
+        if (strcmp(argv[i], "--json") == 0) g_json = 1;
+    if (g_json && strcmp(cmd, "fans") != 0 && strcmp(cmd, "status") != 0 &&
+        strcmp(cmd, "temps") != 0 && strcmp(cmd, "power") != 0 && strcmp(cmd, "watch") != 0) {
+        fprintf(stderr, "%s", L("--json 目前支持 fans/status/temps/power/watch\n",
+                                "--json is currently supported for fans/status/temps/power/watch\n"));
+        return 1;
+    }
 
     /* 未知命令直接给用法再退出 — 不开 SMC (无 AppleSMC 的环境也可见帮助) */
     {
@@ -1164,17 +1689,19 @@ int main(int argc, char **argv) {
     int rc = 0;
 
     if (strcmp(cmd, "fans") == 0) {
-        print_fans();
+        if (g_json) json_fans(); else print_fans();
     } else if (strcmp(cmd, "status") == 0) {
-        print_status();
+        if (g_json) json_status(); else print_status();
     } else if (strcmp(cmd, "temps") == 0) {
-        print_temps();
+        if (g_json) json_temps(); else print_temps();
     } else if (strcmp(cmd, "power") == 0) {
-        power_cmd();
+        if (g_json) json_power(); else power_cmd();
     } else if (strcmp(cmd, "dump") == 0) {
         print_dump();
     } else if (strcmp(cmd, "watch") == 0) {
-        int interval = argc > 2 ? atoi(argv[2]) : 2;
+        int interval = 2;
+        for (int i = 2; i < argc; i++)
+            if (argv[i][0] != '-') { interval = atoi(argv[i]); break; }
         if (interval < 1) interval = 1;
         watch_loop(interval);
     } else if (strcmp(cmd, "set") == 0) {

@@ -19,7 +19,7 @@ language and can be switched at any time from the menu. The CLI follows
 your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
 override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 `/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.4.0).
+are kept grep-stable. Version: `fansctl version` (currently 1.5.0).
 
 ## Build & install
 
@@ -61,7 +61,21 @@ sudo fansctl smart stop      stop smart mode (incl. instances started from the m
 sudo fansctl hold [°C]       thermostat mode, PI closed loop on the hottest sensor (default 70°C,
                              mutually exclusive with smart)
 sudo fansctl hold stop       stop thermostat mode (incl. menu-bar instances)
+fansctl bar install|uninstall|status   manage menu-bar auto-start (no sudo)
+fansctl doctor        collect diagnostics — attach the output when filing issues
 ```
+
+Read-only commands accept `--json` (unknown values are `null`; keys in English
+regardless of interface language); `watch --json` emits one JSON object per
+line:
+
+```sh
+fansctl status --json
+fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+```
+
+`make install` (and the Homebrew formula) also install a man page
+(`man fansctl`) and zsh/bash completions.
 
 ## Menu bar
 
@@ -183,12 +197,13 @@ AuthorizationExecuteWithPrivileges (a password prompt each time).
 
 ## Launch at login
 
-`~/Library/LaunchAgents/local.fansctl.bar.plist` (a copy lives in the repo):
+One command, no sudo, no hand-editing (points the LaunchAgent at the actual
+binary path, handles reload):
 
 ```sh
-# first, replace /Users/USERNAME in the plist with your username
-cp local.fansctl.bar.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.fansctl.bar.plist
+fansctl bar install      # install + start now + start at login
+fansctl bar status       # installed? loaded? running?
+fansctl bar uninstall    # stop and remove
 ```
 
 RunAtLoad + automatic restart on crash (SuccessfulExit=false); quitting from

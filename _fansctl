@@ -1,0 +1,51 @@
+#compdef fansctl
+# fansctl zsh completion — 安装到 fpath (make install 自动放入 site-functions)
+
+local -a subcmds
+subcmds=(
+  'fans:fan RPMs (read-only)'
+  'status:current/target RPMs and mode'
+  'temps:all temperature sensors'
+  'power:power survey (draw, adapter, USB, top processes)'
+  'dump:dump all SMC keys'
+  'watch:refresh loop'
+  'set:set RPM (sudo)'
+  'max:full speed (sudo)'
+  'auto:restore automatic control (sudo)'
+  'smart:smart fan curve (sudo)'
+  'hold:PI thermostat (sudo)'
+  'bar:menu-bar auto-start management'
+  'doctor:collect diagnostics for issue reports'
+  'version:print version'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'command' subcmds
+  return
+fi
+
+local sub=$words[2]
+case $sub in
+  fans|status|temps|power)
+    _arguments '--json[machine-readable JSON output]' ;;
+  watch)
+    _arguments '--json[one JSON object per line]' '1:interval seconds:' ;;
+  smart)
+    if (( CURRENT == 3 )); then
+      _values 'action' stop
+    else
+      _message 'low °C threshold'
+    fi ;;
+  hold)
+    if (( CURRENT == 3 )); then
+      _values 'action' stop
+    else
+      _message 'target °C'
+    fi ;;
+  set)
+    if (( CURRENT == 3 )); then _message 'RPM'; else _message 'fan index'; fi ;;
+  max|auto)
+    (( CURRENT == 3 )) && _message 'fan index' ;;
+  bar)
+    (( CURRENT == 3 )) && _values 'action' install uninstall status ;;
+esac

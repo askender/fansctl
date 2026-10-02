@@ -8,7 +8,7 @@ macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 菜单栏界面中英双语(跟系统语言, 菜单可切换); CLI 同样跟随系统语言
 (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`, 可用 `FANSCTL_LANG=zh|en` 强制)。
 守护进程日志 (/tmp/fansctl.smart.log 等) 恒为中文, 保证可 grep。
-版本: `fansctl version` (当前 1.4.0)。
+版本: `fansctl version` (当前 1.5.0)。
 
 ## 构建与安装
 
@@ -48,7 +48,20 @@ sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart st
 sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
 sudo fansctl hold [°C]       恒温模式, PI 闭环稳定最热传感器(默认 70°C, 与智能互斥)
 sudo fansctl hold stop       结束恒温模式(含菜单栏启动的)
+fansctl bar install|uninstall|status   菜单栏开机自启管理(无需 sudo)
+fansctl doctor        收集诊断信息 —— 报 issue 请附上输出
 ```
+
+只读命令支持 `--json` 机器可读输出 (未知值为 `null`, 键名恒英文); `watch --json`
+每行输出一个 JSON 对象:
+
+```sh
+fansctl status --json
+fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+```
+
+`make install` (及 Homebrew formula) 会一并装 man 手册页 (`man fansctl`) 和
+zsh/bash 补全。
 
 ## 菜单栏
 
@@ -137,12 +150,12 @@ AuthorizationExecuteWithPrivileges(每次弹密码框)。
 
 ## 开机自启
 
-`~/Library/LaunchAgents/local.fansctl.bar.plist` (仓库有副本):
+一条命令搞定, 无需 sudo、无需手改 plist (自动指向实际二进制路径并处理重载):
 
 ```sh
-# 先把 plist 里的 /Users/USERNAME 改成本机用户名
-cp local.fansctl.bar.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.fansctl.bar.plist
+fansctl bar install      # 安装 + 立即启动 + 登录自启
+fansctl bar status       # 是否安装/加载/运行中
+fansctl bar uninstall    # 停止并移除
 ```
 
 RunAtLoad + 崩溃自动拉起(SuccessfulExit=false), 菜单点"退出"不复活。

@@ -1,0 +1,161 @@
+.\" fansctl.1 - manual page for fansctl
+.\" AGPL-3.0-or-later, https://github.com/askender/fansctl
+.Dd October 2, 2026
+.Dt FANSCTL 1
+.Os macOS
+.Sh NAME
+.Nm fansctl
+.Nd fan control and power survey for Apple Silicon Macs \(em one binary, menu bar app + CLI
+.Sh SYNOPSIS
+.Nm
+.Op Cm subcommand
+.Op Ar arguments
+.\" ...
+.Sh DESCRIPTION
+.Nm
+is a single dependency-free binary (C / AppKit, no Electron) that talks to the
+SMC through the 80-byte Apple Silicon ABI.
+.Pp
+Started with no arguments it becomes a menu bar app (it forks to the
+background and does not occupy the terminal).
+With a subcommand it acts as a CLI.
+The CLI follows the system language
+.Pq Ev FANSCTL_LANG , LC_ALL , LC_MESSAGES , LANG ;
+daemon logs
+.Pq smart/hold
+always stay in Chinese so they remain greppable.
+.Ss COMMANDS
+.Bl -tag -width "bar uninstall"
+.It Ic fans
+Fan RPMs, minimum and maximum (read-only).
+.It Ic status
+Current/target RPMs and mode per fan (read-only).
+.It Ic temps
+All temperature sensors (read-only).
+.It Ic power
+Power survey (read-only): system draw
+.Pq SMC key PSTR ,
+power-input telemetry, adapter rating, battery, USB devices' declared current
+draw, and top power processes.
+.It Ic dump
+Dump every SMC key with decoded values.
+.It Ic watch Op Ar seconds
+Refresh loop, default 2 s.
+.It Ic set Ar rpm Op Ar fan
+Set RPM (clamped to the safe range); without a fan index, all fans.
+.It Ic max Op Ar fan
+Full speed.
+.It Ic auto Op Ar fan
+Restore system auto control.
+.It Ic smart Op Ar low high
+Smart curve daemon: below
+.Ar low
+fans follow the system, above
+.Ar high
+full speed, linear in between (default 40~80\(*C).
+.It Im smart stop
+Stop the smart daemon (including instances started from the menu bar) and
+restore auto.
+.It Ic hold Ar target
+Thermostat daemon: a PI closed loop holds the hottest sensor at
+.Ar target
+(default 70\(*C); mutually exclusive with
+.Ic smart .
+.It Ic hold stop
+Stop the thermostat and restore auto.
+.It Ic bar install
+Install the menu bar auto-start LaunchAgent
+.Pq Pa ~/Library/LaunchAgents/local.fansctl.bar.plist ,
+pointing at the current executable; no sudo needed.
+.It Ic bar uninstall
+Remove the LaunchAgent and stop the menu bar app.
+.It Ic bar status
+Show whether auto-start is installed, loaded, and the menu bar is running.
+.It Ic doctor
+Collect diagnostics (model, SMC keys, fans, sensors, helper, LaunchAgent,
+daemons, battery) for issue reports.
+.It Ic version
+Print the version.
+.El
+.Pp
+Commands that change fan state
+.Pq Ic set , max , auto , smart , hold
+need root
+.Pq Xr sudo 8 .
+.Ss JSON OUTPUT
+The read commands
+.Ic fans , status , temps , power , watch
+accept
+.Fl -json
+and emit machine-readable JSON (keys in English regardless of interface
+language; unknown values are
+.Li null ).
+.Ic watch --json
+prints one complete JSON object per line (JSON Lines), suitable for piping
+into
+.Xr jq 1
+or a monitoring pipeline.
+Example:
+.Bd -literal -offset indent
+fansctl status --json
+fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+fansctl temps --json | jq -r '.temps[].celsius' | sort -n | tail -1
+.Ed
+.Ss PRIVILEGES
+A setuid-root helper copy
+.Pq Pa /usr/local/bin/fansctl-root ,
+installed with
+.Cm make install-root ,
+lets the menu bar control fans without password prompts.
+In the helper context only fixed fan verbs
+.Pq Ic __apply , __smart , __hold , smart stop )
+are allowed; it is never a generic privileged execution entry point.
+A system LaunchDaemon
+.Pq Cm make install-restore
+restores auto mode at boot as a safety net.
+.Ss ENVIRONMENT
+.Bl -tag -width "FANSCTL_LANG"
+.It Ev FANSCTL_LANG
+Override the CLI language
+.Pq Cm zh / Cm en ;
+takes precedence over the locale variables.
+.It Ev FANSCTL_DEBUG
+Print SMC protocol details to stderr.
+.El
+.Sh FILES
+.Bl -tag -width "/usr/local/bin/fansctl-root"
+.It Pa ~/Library/LaunchAgents/local.fansctl.bar.plist
+Menu bar auto-start (managed by
+.Ic bar install/uninstall ).
+.It Pa /tmp/fansctl.bar.log
+Menu bar log.
+.It Pa /tmp/fansctl.smart.pid , /tmp/fansctl.hold.pid , /tmp/fansctl.bar.pid
+Daemon/instance state files shared between CLI and menu bar.
+.It Pa /tmp/fansctl.smart.log , /tmp/fansctl.hold.log
+Daemon logs (Chinese by design).
+.It Pa /usr/local/bin/fansctl-root
+Setuid helper (optional).
+.El
+.Sh EXIT STATUS
+Exits 0 on success, non-zero on errors such as missing SMC, permission
+denied, or invalid arguments.
+.Sh EXAMPLES
+.Bd -literal -offset indent
+fansctl status                 # read-only overview
+sudo fansctl smart 55 85       # smart curve, 55~85\(*C
+sudo fansctl set 3000          # all fans to 3000 rpm
+sudo fansctl max && sleep 10 && sudo fansctl auto
+fansctl power                  # who is eating the watts
+fansctl bar install            # menu bar starts at login
+fansctl doctor                 # attach to issue reports
+.Ed
+.Sh SEE ALSO
+Project README (bilingual:
+.Pa README.md
+and
+.Pa README.zh-CN.md )
+at
+.Lk https://github.com/askender/fansctl .
+.Sh LICENSE
+AGPL-3.0-or-later.
+.\" vim: set nospell:

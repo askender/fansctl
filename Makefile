@@ -1,6 +1,10 @@
 CC = /usr/bin/clang
 CFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation -framework AppKit -framework Security
 PREFIX = $(HOME)/.local/bin
+# 文档/补全随 PREFIX 派生: brew 以 PREFIX=#{bin} 调用时正好落在 keg 的 share/ 下
+MANPREFIX ?= $(PREFIX)/../share/man
+ZSHFUNC   ?= $(PREFIX)/../share/zsh/site-functions
+BASHCOMP  ?= $(PREFIX)/../share/bash-completion/completions
 
 all: fansctl
 
@@ -11,9 +15,14 @@ fansctl: fansctl.c fansbar.m fansctl.h
 install: all
 	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
 	cp fansctl $(PREFIX)/
+	mkdir -p $(MANPREFIX)/man1 $(ZSHFUNC) $(BASHCOMP)
+	cp fansctl.1 $(MANPREFIX)/man1/
+	cp _fansctl $(ZSHFUNC)/
+	cp fansctl.bash $(BASHCOMP)/fansctl
 
 uninstall:
 	rm -f $(PREFIX)/fansctl $(PREFIX)/fansbar
+	rm -f $(MANPREFIX)/man1/fansctl.1 $(ZSHFUNC)/_fansctl $(BASHCOMP)/fansctl
 	sudo rm -f /usr/local/bin/fansctl-root
 	sudo launchctl bootout system/local.fansctl.restore 2>/dev/null || true
 	sudo rm -f /Library/LaunchDaemons/local.fansctl.restore.plist
