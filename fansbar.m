@@ -171,6 +171,9 @@ static int hold_idx(void) {
     }
     const char *tkey = NULL;
     double T = hottest_temp(&tkey);
+    /* 最热传感器显示人类可读名 (与 CLI temps/doctor 同一张表), 未知键回退键名 */
+    const char *tn = tkey ? temp_key_name(tkey, g_lang_en) : NULL;
+    const char *tdisp = tn ? tn : (tkey ? tkey : "?");
     char tb[8] = "--", fb[8] = "--", buf[64];
     if (T > -999) snprintf(tb, sizeof tb, "%.0f", T);
     if (mx_ac >= 0) snprintf(fb, sizeof fb, "%.0f", mx_ac / 1000.0);
@@ -188,12 +191,12 @@ static int hold_idx(void) {
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
             off = snprintf(buf, sizeof buf, L("%s %.1f°C  曲线%.0f%%", "%s %.1f°C  curve %.0f%%"),
-                           tkey, T, frac * 100);
+                           tdisp, T, frac * 100);
         } else if (hold) {
             off = snprintf(buf, sizeof buf, L("%s %.1f°C  目标%.0f°C", "%s %.1f°C  target %.0f°C"),
-                           tkey, T, ht);
+                           tdisp, T, ht);
         } else {
-            off = snprintf(buf, sizeof buf, "%s %.1f°C", tkey, T);
+            off = snprintf(buf, sizeof buf, "%s %.1f°C", tdisp, T);
         }
     } else {
         off = snprintf(buf, sizeof buf, "%s", L("温度读取失败", "temp read failed"));

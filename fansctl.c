@@ -1749,7 +1749,7 @@ static int selftest_cmd(void) {
     st_streq(temp_key_name("TH0x", 1), "NAND flash", "TH0x en family");
     st_streq(temp_key_name("Th00", 1), "NAND flash", "Th00 en family");
     st_streq(temp_key_name("Tz11", 0), "热区", "Tz11 zh family");
-    st_streq(temp_key_name("TCMz", 1), "SoC", "TCMz en family");
+    st_streq(temp_key_name("TCMz", 1), "SoC max", "TCMz en family");
     st_streq(temp_key_name("TC10", 0), "SoC 组", "TC10 zh family");
     st_streq(temp_key_name("TaLP", 0), "气流·左", "TaLP zh family");
     st_streq(temp_key_name("TaRF", 1), "Airflow R", "TaRF en family");

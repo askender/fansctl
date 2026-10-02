@@ -123,7 +123,9 @@ static inline int plausible_temp(double v) { return v > -5 && v < 130; }
 /* ==================== 温度传感器键 -> 人类可读名 ====================
    依据: exelban/stats 传感器表 (Apple Silicon Tp/Te/Tg/Tm/TH/Ta 族) + Intel 时代
    SMC 命名惯例 (TS0P 掌托 / TW0P 无线网卡 / TB*T 电池); Tp=性能核 Te=能效核
-   跨 M1~M5 一致。TC??/TCM? 标为 SoC 是推断 (TCMz 恒为本机最热传感器)。
+   跨 M1~M5 一致。TCMz 实测 == max(Tp*)/max(Te*) —— Apple 自己的"SoC 最高温"聚合键
+   (热管理与降频看的就是它; 参考 Okle42 的 IOReport/powermetrics 对照 gist), TCM? 族
+   标 "SoC max/SoC 最高"; TC?? 标 "SoC 组" 是推断。
    未知键返回 NULL, 调用方回退显示键名。'?' = 通配一个字符, 先精确后族匹配。 */
 struct temp_name_tab { const char *pat, *zh, *en; };
 static inline const char *temp_key_name(const char *key, int en) {
@@ -145,7 +147,7 @@ static inline const char *temp_key_name(const char *key, int en) {
         {"TH??", "闪存 NAND",  "NAND flash"},
         {"Th??", "闪存 NAND",  "NAND flash"},
         {"Tz??", "热区",       "Thermal zone"},
-        {"TCM?", "SoC",        "SoC"},
+        {"TCM?", "SoC 最高",   "SoC max"},
         {"TC??", "SoC 组",     "SoC group"},
         {"TaL?", "气流·左",    "Airflow L"},
         {"TaR?", "气流·右",    "Airflow R"},
