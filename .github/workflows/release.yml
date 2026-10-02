@@ -60,7 +60,7 @@ jobs:
           PY
           head -5 /tmp/notes.md
 
-      - name: Create GitHub Release (idempotent: skip if exists)
+      - name: Create GitHub Release (idempotent — skips if exists)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
