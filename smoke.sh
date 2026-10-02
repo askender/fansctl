@@ -19,9 +19,15 @@ echo "[status] 转速与模式"
 
 echo "[temps] 温度传感器"
 [ "$(./fansctl temps | grep -c '°C')" -ge 1 ] && ok "有温度读数" || bad "temps 无温度"
+./fansctl temps | grep -qE '电池|CPU|GPU|SoC|内存|气流|闪存|热区|掌托|无线|环境' \
+    && ok "传感器人类可读名出现" || bad "命名表未生效"
+./fansctl temps --json | grep -q '"name"' && ok "temps --json 含 name 字段" || bad "temps --json 缺 name"
 
 echo "[power] 供电/功率一览"
 ./fansctl power | grep -q "功率" && ok "有功率输出" || bad "power 无输出"
+./fansctl power --watch 1 2>/dev/null | head -2 | grep -q "W" && ok "power --watch 文本流" || bad "power --watch 异常"
+./fansctl power --json --watch 1 2>/dev/null | head -1 | python3 -m json.tool >/dev/null 2>&1 \
+    && ok "power --watch --json JSONL" || bad "power --watch --json 非法"
 
 echo "[--json] 机器可读输出 (回归: usb 数组曾漏闭合括号)"
 for c in fans status temps power; do

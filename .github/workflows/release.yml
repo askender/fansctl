@@ -1,0 +1,113 @@
+name: Release
+
+# 打 tag 推送即自动发布: 构建 zip -> 建 GitHub Release (notes 取自 CHANGELOG.md
+# 对应小节) -> 更新 Homebrew tap formula (url + sha256) 并推送。
+# 需要仓库 secret TAP_TOKEN: fine-grained PAT, 仅 contents:write 权限,
+# 资源限定 askender/homebrew-tap (也可临时用 workflow_dispatch 先空跑 zip/release 部分)。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Stage zip (same 5-file layout as before)
+        run: |
+          d="fansctl-${GITHUB_REF_NAME}-macos-arm64"
+          rm -rf "$d" "${d}.zip"
+          mkdir "$d"
+          cp fansctl LICENSE README.md README.zh-CN.md local.fansctl.bar.plist "$d/"
+          zip -q -r "${d}.zip" "$d"
+          unzip -l "${d}.zip"
+
+      - name: Extract changelog section for this tag
+        run: |
+          python3 - "$GITHUB_REF_NAME" > /tmp/notes.md <<'PY'
+          import sys, re, pathlib
+          tag = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## {re.escape(tag)}\s*\n(.*?)(?=^## |\Z)",
+                        text, re.M | re.S)
+          if not m:
+              sys.exit(f"no ## {tag} section in CHANGELOG.md")
+          body = m.group(1).strip()
+          print(body)
+          print()
+          print("## 下载 / Download")
+          print()
+          print(f"`fansctl-{tag}-macos-arm64.zip` — Apple Silicon (arm64)，ad-hoc 签名，"
+                "零依赖单二进制 / single dependency-free binary, ad-hoc signed.")
+          print()
+          print("首次运行如被 Gatekeeper 拦截：右键 → 打开，或 "
+                "`xattr -d com.apple.quarantine fansctl` /")
+          print("If Gatekeeper blocks it: right-click → Open, or run "
+                "`xattr -d com.apple.quarantine fansctl`.")
+          print()
+          print("安装 / Install: `brew tap askender/tap && brew install fansctl`")
+          print()
+          print("🤖 Generated with [Claude Code](https://claude.com/claude-code)")
+          PY
+          head -5 /tmp/notes.md
+
+      - name: Create GitHub Release (idempotent: skip if exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          d="fansctl-${GITHUB_REF_NAME}-macos-arm64"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists, uploading asset only"
+            gh release upload "$GITHUB_REF_NAME" "${d}.zip" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${d}.zip" \
+              --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+              --notes-file /tmp/notes.md
+          fi
+
+      - name: Download source tarball and compute sha256
+        run: |
+          curl -sL -o /tmp/src.tar.gz \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          shasum -a 256 /tmp/src.tar.gz | awk '{print $1}' > /tmp/sha256.txt
+          echo "sha256=$(cat /tmp/sha256.txt)"
+
+      - name: Bump Homebrew tap formula
+        uses: actions/checkout@v4
+        with:
+          repository: askender/homebrew-tap
+          path: homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+
+      - name: Update formula url + sha256 and push tap
+        run: |
+          cd homebrew-tap
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha=$(cat /tmp/sha256.txt)
+          python3 - "$url" "$sha" <<'PY'
+          import re, sys, pathlib
+          url, sha = sys.argv[1], sys.argv[2]
+          p = pathlib.Path("Formula/fansctl.rb")
+          text = p.read_text(encoding="utf-8")
+          text = re.sub(r'^(  url ).*$', rf'\1"{url}"', text, flags=re.M)
+          text = re.sub(r'^(  sha256 ).*$', rf'\1"{sha}"', text, flags=re.M)
+          p.write_text(text, encoding="utf-8")
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/fansctl.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged, nothing to push"
+          else
+            git commit -m "fansctl ${GITHUB_REF_NAME#v} formula"
+            git push origin HEAD:main
+          fi

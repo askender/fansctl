@@ -1,5 +1,6 @@
 CC = /usr/bin/clang
-CFLAGS = -O2 -Wall -framework IOKit -framework CoreFoundation -framework AppKit -framework Security
+CFLAGS = -O2 -Wall
+LDLIBS = -framework IOKit -framework CoreFoundation -framework AppKit -framework Security
 PREFIX = $(HOME)/.local/bin
 # 文档/补全随 PREFIX 派生: brew 以 PREFIX=#{bin} 调用时正好落在 keg 的 share/ 下
 MANPREFIX ?= $(PREFIX)/../share/man
@@ -9,7 +10,7 @@ BASHCOMP  ?= $(PREFIX)/../share/bash-completion/completions
 all: fansctl
 
 fansctl: fansctl.c fansbar.m fansctl.h
-	$(CC) $(CFLAGS) -o $@ fansctl.c fansbar.m
+	$(CC) $(CFLAGS) -o $@ fansctl.c fansbar.m $(LDLIBS)
 
 # 注意: 不能 cp 原地覆盖旧二进制 — AMFI 对 inode 缓存签名, 覆盖后 exec 会被 SIGKILL
 install: all
@@ -44,6 +45,12 @@ install-restore:
 clean:
 	rm -f fansctl
 
+# 静态分析: clang --analyze 的告警不影响退出码, 抓输出自己判
+analyze: fansctl.c fansbar.m fansctl.h
+	$(CC) $(CFLAGS) --analyze -Xanalyzer -analyzer-output=text fansctl.c fansbar.m 2>/tmp/fansctl-analyze.txt || true
+	cat /tmp/fansctl-analyze.txt
+	! grep -q 'warning:' /tmp/fansctl-analyze.txt || { echo "静态分析有告警 (见上)"; exit 1; }
+
 # 冒烟测试: 只读命令 + setuid 助手越权防护, 不改变风扇状态
 test: fansctl
 	./smoke.sh
@@ -52,4 +59,4 @@ test: fansctl
 restart:
 	launchctl kickstart -k gui/$(shell id -u)/local.fansctl.bar
 
-.PHONY: all clean install uninstall test restart
+.PHONY: all clean install uninstall test restart analyze

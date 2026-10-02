@@ -12,8 +12,10 @@ _fansctl() {
   fi
 
   case $sub in
-    fans|status|temps|power)
+    fans|status|temps)
       [[ $cur == -* ]] && COMPREPLY=( $(compgen -W "--json" -- "$cur") ) ;;
+    power)
+      [[ $cur == -* ]] && COMPREPLY=( $(compgen -W "--json --watch" -- "$cur") ) ;;
     watch)
       [[ $cur == -* ]] && COMPREPLY=( $(compgen -W "--json" -- "$cur") ) ;;
     smart|hold)

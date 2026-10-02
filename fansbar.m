@@ -150,6 +150,13 @@ static int hold_idx(void) {
 
 @implementation BarDelegate
 
+/* 菜单栏应用事实上活到老进程被杀, dealloc 不会真正跑, 但非 ARC 下语义要正确
+   (clang --analyze 会查), 也防将来被别处的代码 retain/release 玩坏 */
+- (void)dealloc {
+    [_timer release];
+    [super dealloc];
+}
+
 - (void)tick {
     int pid = 0; double slo = 0, shi = 0;
     int smart = smart_pid_read(&pid, &slo, &shi);
@@ -360,14 +367,12 @@ static int hold_idx(void) {
                                     action:@selector(doQuit:) keyEquivalent:@"q"];
     [menu addItem:it];
     [it release];
-    return menu;
+    return [menu autorelease]; /* 按命名约定返回 +0, 所有权在接收方 */
 }
 
-/* 换菜单: 属性 setter 会释放旧菜单, 返回的新菜单转交所有权后 release */
+/* 换菜单: setter 先保留新菜单再释放旧菜单; buildMenu 返回 +0, 此处不再 release */
 - (void)rebuildMenu {
-    NSMenu *menu = [self buildMenu];
-    g_item.menu = menu;
-    [menu release];
+    g_item.menu = [self buildMenu];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {

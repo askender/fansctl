@@ -31,12 +31,18 @@ Fan RPMs, minimum and maximum (read-only).
 .It Ic status
 Current/target RPMs and mode per fan (read-only).
 .It Ic temps
-All temperature sensors (read-only).
+All temperature sensors (read-only), with human-readable names where known
+.Pq SoC, CPU P/E-cores, GPU, memory, NAND, battery, airflow...
+and the raw SMC key.
 .It Ic power
 Power survey (read-only): system draw
 .Pq SMC key PSTR ,
 power-input telemetry, adapter rating, battery, USB devices' declared current
 draw, and top power processes.
+.It Ic power Fl -watch Op Ar seconds
+Continuous power monitoring (default 5 s); with
+.Fl -json
+emits one JSON object per line for logging pipelines.
 .It Ic dump
 Dump every SMC key with decoded values.
 .It Ic watch Op Ar seconds
@@ -82,6 +88,16 @@ Commands that change fan state
 .Pq Ic set , max , auto , smart , hold
 need root
 .Pq Xr sudo 8 .
+.Ss NOTIFICATIONS
+.Ic smart
+sends a system notification once when the temperature reaches the high
+threshold (fans at full speed); the thermostat
+.Pq Ic hold
+notifies when it cannot hold the target (more than 3\((*C above it, fans
+already at full speed). The alert re-arms after the temperature drops back.
+Both use a Notification Center banner via
+.Xr osascript 1 ;
+the first one may ask for notification permission.
 .Ss JSON OUTPUT
 The read commands
 .Ic fans , status , temps , power , watch
@@ -89,9 +105,14 @@ accept
 .Fl -json
 and emit machine-readable JSON (keys in English regardless of interface
 language; unknown values are
-.Li null ).
+.Li null ) .
+Temperature entries carry a
+.Li name
+field (English, null when unknown).
 .Ic watch --json
-prints one complete JSON object per line (JSON Lines), suitable for piping
+and
+.Ic power --json --watch
+print one complete JSON object per line (JSON Lines), suitable for piping
 into
 .Xr jq 1
 or a monitoring pipeline.
@@ -99,6 +120,7 @@ Example:
 .Bd -literal -offset indent
 fansctl status --json
 fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+fansctl power --json --watch 5 | jq -c '.system_w'
 fansctl temps --json | jq -r '.temps[].celsius' | sort -n | tail -1
 .Ed
 .Ss PRIVILEGES

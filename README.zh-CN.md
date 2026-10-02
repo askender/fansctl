@@ -8,7 +8,7 @@ macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 菜单栏界面中英双语(跟系统语言, 菜单可切换); CLI 同样跟随系统语言
 (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`, 可用 `FANSCTL_LANG=zh|en` 强制)。
 守护进程日志 (/tmp/fansctl.smart.log 等) 恒为中文, 保证可 grep。
-版本: `fansctl version` (当前 1.5.0)。
+版本: `fansctl version` (当前 1.6.0)。
 
 ## 构建与安装
 
@@ -37,27 +37,33 @@ make restart        # 重启菜单栏 (LaunchAgent 拉起)
 fansctl               启动菜单栏应用(fork 后台, 不占终端)
 fansctl fans          列出风扇转速(只读)
 fansctl status        当前/目标转速与模式(只读)
-fansctl temps         所有温度传感器(只读)
+fansctl temps         所有温度传感器(只读), 已识别的显示人类可读名
+                      (SoC / CPU 性能核·能效核 / GPU / 内存 / 闪存 / 电池 / 气流等)
 fansctl power         供电/功率一览(只读): 功率, 电源输入, 适配器, USB 设备, 功耗Top进程
+fansctl power --watch [秒]   持续功率监测(默认 5 秒)
 fansctl dump          导出全部 SMC 键值(探索用)
 fansctl watch [秒]    循环刷新(默认 2 秒)
 sudo fansctl set <rpm> [N]   设定转速(不带 N = 全部风扇)
 sudo fansctl max [N]         全速
 sudo fansctl auto [N]        恢复自动
-sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart stop 退出恢复)
+sudo fansctl smart [低 高]   智能曲线(默认 40~80°C, Ctrl+C 或 smart stop 退出恢复;
+                             达到高阈值会发一次系统通知)
 sudo fansctl smart stop      结束智能模式(含菜单栏启动的)
-sudo fansctl hold [°C]       恒温模式, PI 闭环稳定最热传感器(默认 70°C, 与智能互斥)
+sudo fansctl hold [°C]       恒温模式, PI 闭环稳定最热传感器(默认 70°C, 与智能互斥;
+                             压不住目标时会发一次系统通知)
 sudo fansctl hold stop       结束恒温模式(含菜单栏启动的)
 fansctl bar install|uninstall|status   菜单栏开机自启管理(无需 sudo)
 fansctl doctor        收集诊断信息 —— 报 issue 请附上输出
 ```
 
-只读命令支持 `--json` 机器可读输出 (未知值为 `null`, 键名恒英文); `watch --json`
-每行输出一个 JSON 对象:
+只读命令支持 `--json` 机器可读输出 (未知值为 `null`, 键名恒英文), 温度
+条目带 `name` 字段; `watch --json` 与 `power --json --watch` 每行输出一个
+JSON 对象:
 
 ```sh
 fansctl status --json
 fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+fansctl power --json --watch 5 | jq -c '.system_w'
 ```
 
 `make install` (及 Homebrew formula) 会一并装 man 手册页 (`man fansctl`) 和

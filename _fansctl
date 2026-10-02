@@ -26,8 +26,10 @@ fi
 
 local sub=$words[2]
 case $sub in
-  fans|status|temps|power)
+  fans|status|temps)
     _arguments '--json[machine-readable JSON output]' ;;
+  power)
+    _arguments '--json[one JSON object per line]' '--watch[continuous monitoring]' '1:interval seconds:' ;;
   watch)
     _arguments '--json[one JSON object per line]' '1:interval seconds:' ;;
   smart)

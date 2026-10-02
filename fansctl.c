@@ -43,6 +43,8 @@ static int g_json;
 /* ==================== 写入/控制 (需要 root) ==================== */
 
 static void print_fans(void);
+static int power_cmd(void);
+static void json_power(void);
 
 #define KR_NOT_PRIVILEGED 0xe00002c1
 
@@ -260,7 +262,9 @@ static void print_temps(void) {
         if (k[0] != 'T') continue;
         double v;
         if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
-            printf("%-6s %9.2f °C\n", k, v);
+            const char *nm = temp_key_name(k, g_lang_en);
+            if (nm) printf("%-6s %-16s %9.2f °C\n", k, nm, v);
+            else    printf("%-6s %18.2f °C\n", k, v);
             found++;
         }
     }
@@ -397,7 +401,10 @@ static void json_temps(void) {
             if (k[0] != 'T') continue;
             double v;
             if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
-                printf("%s{\"key\":\"%s\",\"celsius\":%.2f}", first ? "" : ",", k, v);
+                printf("%s{\"key\":\"%s\",\"name\":", first ? "" : ",", k);
+                const char *nm = temp_key_name(k, 1);
+                if (nm) json_str(nm); else fputs("null", stdout);
+                printf(",\"celsius\":%.2f}", v);
                 first = 0;
             }
         }
@@ -422,6 +429,23 @@ static uint64_t cont_ns(void) {
     return mach_continuous_time() * g_timebase.numer / g_timebase.denom;
 }
 
+/* 通知中心横幅: 中间子进程再 fork 出执行者后立即退出, 控制循环只等几毫秒的
+   waitpid, 不会被 osascript 启动耗时拖住。守护进程上下文无 LANG, 文案由调用方
+   用 L() 备好 (默认中文); msg 内不得含双引号 (我们的消息只有数字与°C) */
+static void notify_send(const char *msg) {
+    pid_t pid = fork();
+    if (pid > 0) { int st; waitpid(pid, &st, 0); return; }
+    if (pid < 0) return;
+    if (fork() == 0) {
+        char script[512];
+        snprintf(script, sizeof script,
+                 "display notification \"%s\" with title \"fansctl\"", msg);
+        execl("/usr/bin/osascript", "osascript", "-e", script, (char *)NULL);
+        _exit(0);
+    }
+    _exit(0);
+}
+
 static int smart_loop(double t_lo, double t_hi) {
     int n = fan_count();
     if (n < 1) n = 1;
@@ -444,7 +468,7 @@ static int smart_loop(double t_lo, double t_hi) {
            t_lo, t_hi);
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
-    int rc = 0;
+    int rc = 0, notified = 0;
     while (!g_stop) {
         if (g_reload) { /* pidfile 里的新阈值就地生效, 不打断风扇控制 */
             g_reload = 0;
@@ -472,6 +496,20 @@ static int smart_loop(double t_lo, double t_hi) {
         double frac = (T - t_lo) / (t_hi - t_lo);
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
+        /* 高温告警: 达到高阈值(=满速)通知一次, 回落 2°C 后解除, 下次越限再报 */
+        if (frac >= 1 && !notified) {
+            notified = 1;
+            char m[160];
+            snprintf(m, sizeof m,
+                     L("温度 %.1f°C 达到高阈值 %.0f°C, 风扇已全速 —— 请检查散热",
+                       "temperature %.1f°C reached the %.0f°C high threshold, fans at full speed — check cooling"),
+                     T, t_hi);
+            notify_send(m);
+            printf("%s", L("[已发送高温通知]\n", "[high-temperature notification sent]\n"));
+            fflush(stdout);
+        } else if (notified && T < t_hi - 2.0) {
+            notified = 0;
+        }
         for (int f = 0; f < n; f++) {
             double mn = 0, mx = 6000;
             read_rpm_key(f, "Mn", &mn);
@@ -570,6 +608,17 @@ static void watch_loop(int interval) {
     for (;;) {
         if (g_json) json_status(); /* 每拍一个完整 JSON 对象 (JSONL) */
         else print_status_line();
+        fflush(stdout);
+        sleep(interval);
+    }
+}
+
+/* power --watch: 持续功率监测, 间隔默认 5 秒 (功率采集比 status 重: 含 USB 枚举与
+   进程采样)。--json 时每行一个完整对象 (JSONL), 可直接接 jq/记录管道 */
+static void power_watch_loop(int interval) {
+    for (;;) {
+        if (g_json) json_power();
+        else power_cmd();
         fflush(stdout);
         sleep(interval);
     }
@@ -1075,7 +1124,7 @@ static int hold_loop(double t_set) {
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
     double e_prev = 0, t_prev = -999;
-    int rc = 0;
+    int rc = 0, notified = 0;
     while (!g_stop) {
         if (g_reload) { /* pidfile 里的新目标就地生效, 不打断控制 */
             g_reload = 0;
@@ -1100,6 +1149,20 @@ static int hold_loop(double t_set) {
         double Ts = t_prev > -999 ? t_prev + 0.3 * (T - t_prev) : T; /* EMA 平滑 */
         double e = Ts - t_set;
         double dT = t_prev > -999 ? Ts - t_prev : 0;
+        /* 压不住告警: 持续高于目标 3°C (PI 此时必然已顶到满速) 通知一次, 回落后解除 */
+        if (Ts > t_set + 3.0 && !notified) {
+            notified = 1;
+            char m[160];
+            snprintf(m, sizeof m,
+                     L("恒温目标 %.1f°C 压不住: 当前 %.1f°C, 风扇已满速 —— 请检查散热",
+                       "thermostat cannot hold %.1f°C: now %.1f°C, fans at full speed — check cooling"),
+                     t_set, Ts);
+            notify_send(m);
+            printf("%s", L("[已发送过热通知]\n", "[overheat notification sent]\n"));
+            fflush(stdout);
+        } else if (notified && Ts < t_set + 1.0) {
+            notified = 0;
+        }
         for (int f = 0; f < n; f++) {
             double mn = 0, mx = 6000;
             read_rpm_key(f, "Mn", &mn);
@@ -1503,10 +1566,17 @@ static int doctor_cmd(void) {
         scan_temp_keys();
         const char *hk = NULL;
         double ht = hottest_temp(&hk);
-        if (g_tkey_n > 0)
-            printf(L("温度传感器: %d 个, 最热 %s %.1f°C\n",
-                     "Temperature sensors: %d, hottest %s %.1f°C\n"),
-                   g_tkey_n, hk ? hk : "?", ht);
+        if (g_tkey_n > 0) {
+            const char *hn = hk ? temp_key_name(hk, g_lang_en) : NULL;
+            if (hn)
+                printf(L("温度传感器: %d 个, 最热 %s (%s) %.1f°C\n",
+                         "Temperature sensors: %d, hottest %s (%s) %.1f°C\n"),
+                       g_tkey_n, hk ? hk : "?", hn, ht);
+            else
+                printf(L("温度传感器: %d 个, 最热 %s %.1f°C\n",
+                         "Temperature sensors: %d, hottest %s %.1f°C\n"),
+                       g_tkey_n, hk ? hk : "?", ht);
+        }
         else
             printf("%s", L("温度传感器: 未发现\n", "Temperature sensors: none found\n"));
         printf(L("PSTR (机器功率键): %s\n", "PSTR (system power key): %s\n"),
@@ -1591,14 +1661,15 @@ static void print_usage(void) {
         "  fans            风扇转速(只读)\n"
         "  status          风扇当前/目标转速与模式\n"
         "  temps           所有温度传感器\n"
-        "  power           供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
+        "  power [--watch [秒]]  供电/功率一览: 机器功率, 电源输入, 适配器, USB 设备, 功耗Top进程\n"
         "  dump            导出全部 SMC 键\n"
         "  watch [秒]      循环刷新\n"
-        "  (--json)        fans/status/temps/power/watch 的机器可读输出 (watch 每行一个)\n"
+        "  (--json)        fans/status/temps/power/watch 的机器可读输出\n"
+        "                  (watch / power --watch 每行一个对象)\n"
         "  set <rpm> [N]   设定转速, 不带 N 作用于全部风扇 (需 sudo)\n"
         "  max [N]         全速, 不带 N 作用于全部风扇 (需 sudo)\n"
         "  auto [N]        恢复自动, 不带 N 作用于全部风扇 (需 sudo)\n"
-        "  smart [低 高]   智能曲线, 默认 40~80°C (需 sudo)\n"
+        "  smart [低 高]   智能曲线, 默认 40~80°C; 达到高阈值会发系统通知 (需 sudo)\n"
         "  smart stop      结束智能模式(含菜单栏启动的), 恢复自动 (需 sudo)\n"
         "  hold <°C>       恒温模式, PI 闭环把最热传感器稳定在目标温度,\n"
         "                  默认 70°C; 与智能模式互斥 (需 sudo)\n"
@@ -1613,14 +1684,15 @@ static void print_usage(void) {
         "  fans            fan RPMs (read-only)\n"
         "  status          current/target RPMs and mode\n"
         "  temps           all temperature sensors\n"
-        "  power           power survey: system draw, input, adapter, USB, top processes\n"
+        "  power [--watch [sec]]  power survey: system draw, input, adapter, USB, top processes\n"
         "  dump            dump all SMC keys\n"
         "  watch [sec]     refresh loop\n"
-        "  (--json)        machine-readable JSON for fans/status/temps/power/watch (one object per line for watch)\n"
+        "  (--json)        machine-readable JSON for fans/status/temps/power/watch\n"
+        "                  (one object per line for watch / power --watch)\n"
         "  set <rpm> [N]   set RPM, all fans without N (sudo)\n"
         "  max [N]         full speed, all fans without N (sudo)\n"
         "  auto [N]        back to automatic, all fans without N (sudo)\n"
-        "  smart [lo hi]   smart curve, default 40~80°C (sudo)\n"
+        "  smart [lo hi]   smart curve, default 40~80°C; sends a notification at the high threshold (sudo)\n"
         "  smart stop      stop smart mode (incl. menu-bar instances), restore auto (sudo)\n"
         "  hold <°C>       thermostat: PI loop holds the hottest sensor at target,\n"
         "                  default 70°C; mutually exclusive with smart (sudo)\n"
@@ -1695,7 +1767,15 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "temps") == 0) {
         if (g_json) json_temps(); else print_temps();
     } else if (strcmp(cmd, "power") == 0) {
-        if (g_json) json_power(); else power_cmd();
+        int widx = -1;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--watch") == 0) { widx = i; break; }
+        if (widx >= 0) {
+            int interval = 5;
+            if (widx + 1 < argc && argv[widx + 1][0] != '-') interval = atoi(argv[widx + 1]);
+            if (interval < 1) interval = 1;
+            power_watch_loop(interval);
+        } else if (g_json) json_power(); else power_cmd();
     } else if (strcmp(cmd, "dump") == 0) {
         print_dump();
     } else if (strcmp(cmd, "watch") == 0) {

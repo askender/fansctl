@@ -19,7 +19,7 @@ language and can be switched at any time from the menu. The CLI follows
 your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
 override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 `/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.5.0).
+are kept grep-stable. Version: `fansctl version` (currently 1.6.0).
 
 ## Build & install
 
@@ -49,29 +49,33 @@ helper; pure UI/read-only changes do not need it.
 fansctl               start the menu-bar app (forks to background)
 fansctl fans          list fan RPMs (read-only)
 fansctl status        current/target RPMs and mode (read-only)
-fansctl temps         all temperature sensors (read-only)
+fansctl temps         all temperature sensors, human-readable names where known
+                      (SoC, CPU P/E-cores, GPU, memory, NAND, battery, airflow)
 fansctl power         power survey (read-only): system draw, input, adapter, USB, top processes
+fansctl power --watch [sec]   continuous power monitoring (default 5 s)
 fansctl dump          dump all SMC keys (exploration)
 fansctl watch [sec]   refresh loop (default 2 s)
 sudo fansctl set <rpm> [N]   set RPM (no N = all fans)
 sudo fansctl max [N]         full speed
 sudo fansctl auto [N]        back to automatic
-sudo fansctl smart [lo hi]   smart curve (default 40~80°C; Ctrl+C or smart stop exits and restores)
+sudo fansctl smart [lo hi]   smart curve (default 40~80°C; Ctrl+C or smart stop exits and restores;
+                             notifies once when the high threshold is hit)
 sudo fansctl smart stop      stop smart mode (incl. instances started from the menu bar)
 sudo fansctl hold [°C]       thermostat mode, PI closed loop on the hottest sensor (default 70°C,
-                             mutually exclusive with smart)
+                             mutually exclusive with smart; notifies if it cannot hold the target)
 sudo fansctl hold stop       stop thermostat mode (incl. menu-bar instances)
 fansctl bar install|uninstall|status   manage menu-bar auto-start (no sudo)
 fansctl doctor        collect diagnostics — attach the output when filing issues
 ```
 
 Read-only commands accept `--json` (unknown values are `null`; keys in English
-regardless of interface language); `watch --json` emits one JSON object per
-line:
+regardless of interface language); temperature entries carry a `name` field.
+`watch --json` and `power --json --watch` emit one JSON object per line:
 
 ```sh
 fansctl status --json
 fansctl watch --json 5 | jq -c '.fans[0].actual_rpm'
+fansctl power --json --watch 5 | jq -c '.system_w'
 ```
 
 `make install` (and the Homebrew formula) also install a man page

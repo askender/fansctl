@@ -12,7 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.5.0"
+#define FANSCTL_VERSION "1.6.0"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
@@ -119,6 +119,52 @@ static inline int read_key_value(const char *keyname, UInt32 *type_out, double *
 }
 
 static inline int plausible_temp(double v) { return v > -5 && v < 130; }
+
+/* ==================== 温度传感器键 -> 人类可读名 ====================
+   依据: exelban/stats 传感器表 (Apple Silicon Tp/Te/Tg/Tm/TH/Ta 族) + Intel 时代
+   SMC 命名惯例 (TS0P 掌托 / TW0P 无线网卡 / TB*T 电池); Tp=性能核 Te=能效核
+   跨 M1~M5 一致。TC??/TCM? 标为 SoC 是推断 (TCMz 恒为本机最热传感器)。
+   未知键返回 NULL, 调用方回退显示键名。'?' = 通配一个字符, 先精确后族匹配。 */
+struct temp_name_tab { const char *pat, *zh, *en; };
+static inline const char *temp_key_name(const char *key, int en) {
+    static const struct temp_name_tab exact[] = {
+        {"TB0T", "电池",     "Battery"},
+        {"TB1T", "电池 1",   "Battery 1"},
+        {"TB2T", "电池 2",   "Battery 2"},
+        {"TW0P", "无线网卡", "AirPort (Wi-Fi)"},
+        {"TS0P", "掌托左",   "Palm rest L"},
+        {"TS1P", "掌托右",   "Palm rest R"},
+        {"TAOL", "环境",     "Ambient"},
+        {NULL, NULL, NULL}
+    };
+    static const struct temp_name_tab fam[] = {
+        {"Tp??", "CPU 性能核", "CPU P-core"},
+        {"Te??", "CPU 能效核", "CPU E-core"},
+        {"Tg??", "GPU 核心",   "GPU core"},
+        {"Tm??", "内存",       "Memory"},
+        {"TH??", "闪存 NAND",  "NAND flash"},
+        {"Th??", "闪存 NAND",  "NAND flash"},
+        {"Tz??", "热区",       "Thermal zone"},
+        {"TCM?", "SoC",        "SoC"},
+        {"TC??", "SoC 组",     "SoC group"},
+        {"TaL?", "气流·左",    "Airflow L"},
+        {"TaR?", "气流·右",    "Airflow R"},
+        {"Ta??", "气流",       "Airflow"},
+        {"TB?T", "电池",       "Battery"},
+        {NULL, NULL, NULL}
+    };
+    for (int t = 0; t < 2; t++) {
+        const struct temp_name_tab *tab = t == 0 ? exact : fam;
+        for (int i = 0; tab[i].pat; i++) {
+            int ok = 1;
+            for (int c = 0; tab[i].pat[c]; c++)
+                if (tab[i].pat[c] != '?' &&
+                    (c >= 4 || key[c] == 0 || key[c] != tab[i].pat[c])) { ok = 0; break; }
+            if (ok && key[strlen(tab[i].pat)] == 0) return en ? tab[i].en : tab[i].zh;
+        }
+    }
+    return NULL;
+}
 
 static inline int fan_count(void) {
     double v = 0;
