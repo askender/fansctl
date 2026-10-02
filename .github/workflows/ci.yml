@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    # Apple Silicon runner — same SMC surface the tool targets
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Smoke test (read-only, never touches fan state)
+        run: make test
+      - name: Version check
+        run: ./fansctl version

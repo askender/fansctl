@@ -12,6 +12,14 @@ macOS SMC 风扇/温度工具, MacBook Pro 16" M1 Max (MacBookPro18,4) 实测。
 
 ## 构建与安装
 
+Homebrew (从 release 源码 tag 构建):
+
+```sh
+brew tap askender/tap && brew install fansctl
+```
+
+或源码编译:
+
 ```sh
 make                # 编译出 ./fansctl
 make install        # 装到 ~/.local/bin (先删后拷, AMFI 坑)

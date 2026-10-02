@@ -1,5 +1,6 @@
 # fansctl
 
+[![CI](https://github.com/askender/fansctl/actions/workflows/ci.yml/badge.svg)](https://github.com/askender/fansctl/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/askender/fansctl)](https://github.com/askender/fansctl/releases)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg)](#known-smc-facts)
@@ -21,6 +22,14 @@ override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 are kept grep-stable. Version: `fansctl version` (currently 1.4.0).
 
 ## Build & install
+
+Homebrew (builds from the release source tag):
+
+```sh
+brew tap askender/tap && brew install fansctl
+```
+
+Or from a checkout:
 
 ```sh
 make                # build ./fansctl
