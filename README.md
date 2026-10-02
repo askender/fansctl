@@ -126,6 +126,19 @@ and menu bar. SIGTERM exits gracefully (restores auto); log:
 `/tmp/fansctl.smart.log` (includes the pid that sent the stop signal, useful
 for debugging unexpected exits).
 
+**Power feedforward** (v1.8.0): system power draw ≈ heat output, and the
+power signal moves seconds before the temperature does. Smart mode reads the
+SMC key `PSTR` (second-level real-time) each tick, subtracts the charging
+component while charging (that energy goes into the battery, not the heatsink)
+and feeds it through a lead-lag filter (fast/slow EMA difference). On a load
+ramp (compilation, model loading) the fast line lifts first and the fans spin
+up immediately — about 6 s earlier than waiting for the die to warm. In steady
+state the two EMAs reconverge, the feedforward decays to zero, and the
+temperature curve owns the steady state; on battery or machines without `PSTR`
+it steps aside entirely. The boost is rate-limited (250 rpm per second) and
+capped (1500 rpm); the worst case of a wrong feedforward is a few seconds of
+extra spinning — the temperature feedback corrects it immediately.
+
 Robustness:
 
 - **Wake handoff** — a stretched tick (continuous clock
@@ -137,10 +150,15 @@ Robustness:
   auto, replaced the target), fansctl retakes control or rewrites the target
   immediately
 - **Write backoff** — when the SMC is busy (0x82, thermal controller
-  occupied), retries with exponential backoff for ~1.5 s instead of hammering
+  occupied), retries with exponential backoff for ~1.5 s; if writes keep
+  failing (controller wedged by another tool), the daemon does **not** exit:
+  it backs off exponentially (5 s → 60 s cap) while still monitoring
+  temperatures and returns to control automatically when writes recover
 - **smart stop waits for cleanup** — returns only after the daemon has
   restored auto and cleared its pidfile, so the caller's immediately
-  following set is not overridden; reports failure honestly on timeout
+  following set is not overridden; reports failure honestly on timeout.
+  The pid in the pidfile is verified via `proc_pidpath` before signaling —
+  a recycled pid is never killed
 - SMC read failures reopen the connection and retry 3 times (the connection
   can be briefly invalid right after wake)
 

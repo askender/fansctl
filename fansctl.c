@@ -486,6 +486,62 @@ static void notify_send(const char *msg) {
     _exit(0);
 }
 
+/* ==================== 智能模式功耗前馈 ====================
+   热量还没到, 风扇先动: 整机功耗 ≈ 发热量, 功耗一跳 (编译/加载大模型) 转速
+   立刻跟上, 而不是等芯片热了才反应, 实测可提前约 6 秒 (参考 TomEageer/fanctl)。
+   数据源用 SMC 键 PSTR (秒级实时; ioreg 的 SystemPowerIn 分钟级刷新, 做前馈太钝)。
+   检测用"快慢 EMA 差"(超前-滞后滤波): 负载上坡时快线先抬, 稳态后两线追平,
+   前馈自然归零 —— 温度曲线接管稳态, 前馈只管瞬态, 不会长期多转。
+   只升不降 (升了温度反馈会立刻修正, 最坏是白先转几秒; 降向交给温度曲线)。
+   充电时扣除充电分量 (那部分能量入电池不发热); 电池供电/无 PSTR 键时前馈
+   自动退场。纯函数化, __selftest 里有闭环仿真断言 */
+#define FF_A_FAST  0.30    /* 快 EMA 系数 (1 秒拍) */
+#define FF_A_SLOW  0.10    /* 慢 EMA 系数 */
+#define FF_W_THRESH 3.0    /* 快慢差超过此值才算负载上坡 (W), 滤遥测抖动 */
+#define FF_GAIN    60.0    /* 前馈增益 rpm/W */
+#define FF_MAX     1500.0  /* 前馈增量上限 rpm */
+#define FF_STEP    250.0   /* 前馈增量每拍限速 rpm (升/降同速, 平滑) */
+
+struct ff_state { double w_fast, w_slow, boost; int have; };
+static void ff_init(struct ff_state *st) {
+    st->w_fast = st->w_slow = st->boost = 0;
+    st->have = 0;
+}
+
+/* 一拍: w = 本拍整机功耗 W (已扣充电; <=0 表示无数据)。返回当前前馈增量 rpm */
+static double ff_tick(struct ff_state *st, double w) {
+    if (w <= 0) { /* 电池/无 PSTR: 增量平滑退场; 数据回来时重建 EMA 基线 */
+        if (st->boost > 0) {
+            st->boost -= FF_STEP;
+            if (st->boost < 0) st->boost = 0;
+        }
+        st->have = 0;
+        return st->boost;
+    }
+    if (!st->have) { st->have = 1; st->w_fast = st->w_slow = w; return st->boost; }
+    st->w_fast += FF_A_FAST * (w - st->w_fast);
+    st->w_slow += FF_A_SLOW * (w - st->w_slow);
+    double lead = st->w_fast - st->w_slow; /* 上坡强度: 稳态时为 0 */
+    double target = 0;
+    if (lead > FF_W_THRESH) target = (lead - FF_W_THRESH) * FF_GAIN;
+    if (target > FF_MAX) target = FF_MAX;
+    if (st->boost < target) {
+        st->boost += FF_STEP;
+        if (st->boost > target) st->boost = target;
+    } else {
+        st->boost -= FF_STEP;
+        if (st->boost < target) st->boost = target;
+    }
+    return st->boost;
+}
+
+/* SMC 写楔住时的退避时长: 5 秒起步每失败一次翻倍, 60 秒封顶 */
+static uint64_t wedge_delay_ns(int wfail) {
+    int s = 5 << (wfail - 1);
+    if (s > 60) s = 60;
+    return (uint64_t)s * 1000000000ULL;
+}
+
 static int smart_loop(double t_lo, double t_hi) {
     int n = fan_count();
     if (n < 1) n = 1;
@@ -502,14 +558,25 @@ static int smart_loop(double t_lo, double t_hi) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGUSR1, on_reload_signal); /* __smart thresh <lo> <hi> 就地更新阈值 */
-    printf(L("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值; Ctrl+C 退出并恢复自动\n",
+    struct ff_state ff;
+    ff_init(&ff);
+    int wfail = 0; /* 连续写入失败数: SMC 楔住时指数退避 (5s→60s) 的级数 */
+    printf(L("智能模式: <=%.0f°C 自动 (基线跟随系统), >=%.0f°C 全速, 中间线性插值, 功耗前馈; Ctrl+C 退出并恢复自动\n",
              "Smart mode: <=%.0f°C auto (baseline follows system), >=%.0f°C full speed, "
-             "linear in between; Ctrl+C exits and restores auto\n"),
+             "linear in between, power feedforward; Ctrl+C exits and restores auto\n"),
            t_lo, t_hi);
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
     int rc = 0, notified = 0;
     while (!g_stop) {
+        /* SMC 楔住退避: 上拍写入连续失败 (温控器被外部楔住/占用), 不硬敲不退出,
+           隔指数时长再试, 期间温度照读 —— 恢复写入的那拍自然回到控制 */
+        if (wfail > 0) {
+            uint64_t until = tick_ns + wedge_delay_ns(wfail);
+            while (cont_ns() < until && !g_stop) usleep(100 * 1000);
+            tick_ns = cont_ns();
+            if (g_stop) break;
+        }
         if (g_reload) { /* pidfile 里的新阈值就地生效, 不打断风扇控制 */
             g_reload = 0;
             int p; double nl = 0, nh = 0;
@@ -550,6 +617,19 @@ static int smart_loop(double t_lo, double t_hi) {
         } else if (notified && T < t_hi - 2.0) {
             notified = 0;
         }
+        /* 功耗前馈: PSTR 整机功耗 (秒级), 充电时扣掉充电分量 (那部分入电池不发热) */
+        double pw = -1;
+        read_key_value("PSTR", NULL, &pw, NULL);
+        double ff_w = 0; /* 前馈输入: 净功耗 (0=无数据) */
+        if (pw > 0 && pw < 1000) {
+            struct power_info p;
+            if (power_read(&p) == 0 && p.charging && p.charge_w > 0) {
+                pw -= p.charge_w;
+                if (pw <= 0) pw = 0;
+            }
+            ff_w = pw;
+        }
+        double boost = ff_tick(&ff, ff_w);
         for (int f = 0; f < n; f++) {
             double mn = 0, mx = 6000;
             read_rpm_key(f, "Mn", &mn);
@@ -592,18 +672,29 @@ static int smart_loop(double t_lo, double t_hi) {
                 manual[f] = 1;
             }
             double w = base[f] + frac * (mx - base[f]);
+            if (boost > 0 && frac > 0) w += boost; /* 前馈只加在有控制权的拍 */
             if (w < mn) w = mn;
             if (w > mx) w = mx;
             want[f] = w;
             if (last[f] < 0 || fabs(w - last[f]) > 10) {
-                if (write_tg(f, w) != 0) { rc = 1; break; }
+                if (write_tg(f, w) != 0) {
+                    /* 写楔住: 进退避, 不退出 (守护进程还在看温度, 恢复即回控制) */
+                    wfail++;
+                    if (wfail == 1)
+                        printf("%s", L("[写入被 SMC 拒绝, 进入退避监测 (最长 60 秒/次)]\n",
+                                       "[write refused by SMC, backing off (up to 60 s between retries)]\n"));
+                    fflush(stdout);
+                    continue;
+                }
+                wfail = 0;
                 last[f] = w;
             }
         }
         if (rc != 0) break;
         printf(L("[%.0f~%.0f°C] %s %.1f°C 曲线%.0f%% |", "[%.0f~%.0f°C] %s %.1f°C curve %.0f%% |"),
                t_lo, t_hi, tkey ? tkey : "?", T, frac * 100);
-        for (int f = 0; f < n; f++) {
+        if (pw > 0 && boost > 0)
+            printf(L(" %.0fW 前馈+%.0f |", " %.0fW ff+%.0f |"), pw, boost);        for (int f = 0; f < n; f++) {
             double ac = -1;
             read_rpm_key(f, "Ac", &ac);
             if (manual[f] && want[f] > 0 && base[f] > 0)
@@ -1089,11 +1180,29 @@ static void json_power(void) {
 
 /* ============ 菜单栏的 root 侧入口 (经授权弹窗重新执行自身) ============ */
 
+/* pidfile 里的 pid 现在还是不是我们的守护进程? pid 复用后盲目 kill 会误伤无辜
+   进程: proc_pidpath 对比可执行文件路径, 与自身 (含菜单栏等价的启动路径) 不符
+   即拒绝发送信号。查不到路径时保守放弃 kill, 提示手工处理 */
+static int self_path(char out[PATH_MAX]); /* 定义在 LaunchAgent 管理一节 */
+static int pid_is_ours(int pid) {
+    char path[PATH_MAX];
+    if (proc_pidpath(pid, path, sizeof path) <= 0) return 0;
+    char self[PATH_MAX];
+    if (self_path(self) != 0) return 0;
+    return strcmp(path, self) == 0;
+}
+
 /* 结束运行中的智能模式: SIGTERM 优雅退出(其信号处理器恢复自动并清 pidfile)。
    CLI "smart stop" 与隐藏 "__smart stop" 共用 */
 static int smart_stop(void) {
     int pid; double lo, hi;
     if (!smart_pid_read(&pid, &lo, &hi)) { fprintf(stderr, "%s", L("智能模式未在运行\n", "smart mode is not running\n")); return 1; }
+    if (!pid_is_ours(pid)) {
+        fprintf(stderr, L("pid %d 已不是 fansctl 进程 (pid 复用?), 拒绝误杀; 请手工清理 %s\n",
+                          "pid %d is no longer a fansctl process (pid reuse?), refusing to kill; clean %s manually\n"),
+                pid, SMART_PIDFILE);
+        return 1;
+    }
     if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
     /* 等守护进程完成收尾(恢复自动 + 清 pidfile)再返回, 否则它的退出清理会
        覆盖调用方紧接着的设速(实测: stop 后立即 __apply max 被 fan_auto 覆盖)。
@@ -1121,6 +1230,12 @@ static int smart_stop(void) {
 static int hold_stop(void) {
     int pid; double t;
     if (!hold_pid_read(&pid, &t)) { fprintf(stderr, "%s", L("恒温模式未在运行\n", "thermostat is not running\n")); return 1; }
+    if (!pid_is_ours(pid)) {
+        fprintf(stderr, L("pid %d 已不是 fansctl 进程 (pid 复用?), 拒绝误杀; 请手工清理 %s\n",
+                          "pid %d is no longer a fansctl process (pid reuse?), refusing to kill; clean %s manually\n"),
+                pid, HOLD_PIDFILE);
+        return 1;
+    }
     if (kill(pid, SIGTERM) != 0) { perror("kill"); return 1; }
     for (int i = 0; i < 100; i++) {
         int p; double x;
@@ -1165,7 +1280,14 @@ static int hold_loop(double t_set) {
     uint64_t tick_ns = cont_ns();
     double e_prev = 0, t_prev = -999;
     int rc = 0, notified = 0;
+    int wfail = 0; /* 连续写入失败数: 与智能模式同款退避 */
     while (!g_stop) {
+        if (wfail > 0) { /* SMC 楔住退避: 不硬敲不退出, 温度照读 */
+            uint64_t until = tick_ns + wedge_delay_ns(wfail);
+            while (cont_ns() < until && !g_stop) usleep(100 * 1000);
+            tick_ns = cont_ns();
+            if (g_stop) break;
+        }
         if (g_reload) { /* pidfile 里的新目标就地生效, 不打断控制 */
             g_reload = 0;
             int p; double nt = 0;
@@ -1249,7 +1371,16 @@ static int hold_loop(double t_set) {
             if (rpm[f] < mn) rpm[f] = mn;
             if (rpm[f] > mx) rpm[f] = mx;
             if (last[f] < 0 || fabs(rpm[f] - last[f]) > 10) {
-                if (write_tg(f, rpm[f]) != 0) { rc = 1; break; }
+                if (write_tg(f, rpm[f]) != 0) {
+                    /* 写楔住: 进退避, 不退出 (同智能模式) */
+                    wfail++;
+                    if (wfail == 1)
+                        printf("%s", L("[写入被 SMC 拒绝, 进入退避监测 (最长 60 秒/次)]\n",
+                                       "[write refused by SMC, backing off (up to 60 s between retries)]\n"));
+                    fflush(stdout);
+                    continue;
+                }
+                wfail = 0;
                 last[f] = rpm[f];
             }
         }
@@ -1799,6 +1930,51 @@ static int selftest_cmd(void) {
     printf("%s", L("[自测] 温度合理区间\n", "[selftest] temperature plausibility\n"));
     st_ok(!plausible_temp(-10) && plausible_temp(0) && plausible_temp(60) &&
           plausible_temp(129.9) && !plausible_temp(130), "plausible_temp 边界");
+
+    printf("%s", L("[自测] 功耗前馈闭环仿真 (热惯性模型)\n",
+                   "[selftest] power feedforward closed-loop simulation (thermal-mass model)\n"));
+    {
+        /* 合成热模型: C·dT/dt = P_heat - h(rpm)·(T - T_amb)。前馈只依赖功耗序列
+           (纯函数 ff_tick), 温度只用来核验前馈效果 —— 功耗阶跃后温度还在爬的
+           最初几拍, 前馈应已把转速抬起来 */
+        const double TAMB = 30.0, HEAT = 0.9, HMAX = 1.6;
+        double T = 45.0, rpm = 1200.0;
+        struct ff_state st;
+        ff_init(&st);
+        int boosted_in_3 = 0; /* 功耗 30→90W 后 3 拍内前馈是否已 >0 */
+        double peak_ff = 0, peak_T = 0;
+        for (int tick = 0; tick < 60; tick++) {
+            double W = tick < 20 ? 30.0 : 90.0; /* 第 20 拍 3 倍负载阶跃 */
+            double ff = ff_tick(&st, W);
+            rpm += (1200.0 + ff - rpm) * 0.8;   /* 转速一阶滞后趋近目标 */
+            double h = HEAT + (HMAX - HEAT) * (rpm - 1200.0) / 4800.0;
+            T += (W * 0.02 * HEAT - h * (T - TAMB) * 0.06);
+            if (tick >= 20 && tick < 24 && ff > 0) boosted_in_3 = 1;
+            if (ff > peak_ff) peak_ff = ff;
+            if (T > peak_T) peak_T = T;
+        }
+        st_ok(boosted_in_3, "前馈在功耗阶跃后 3 拍内响应");
+        st_ok(peak_ff > 500 && peak_ff <= FF_MAX + 1e-9, "前馈峰值量级与限幅");
+        st_ok(peak_T < 75.0, "闭环仿真温度有界 (<75°C)");
+        /* 稳态归零: 功耗回到稳态后快慢 EMA 追平, 前馈必须退场, 不长期多转 */
+        {
+            struct ff_state st2;
+            ff_init(&st2);
+            for (int i = 0; i < 40; i++) ff_tick(&st2, 90.0); /* 长时间满载 */
+            st_ok(st2.boost == 0, "稳态前馈归零 (不长期多转)");
+            /* 数据消失 (拔电/无 PSTR): 增量平滑退场 */
+            double b = ff_tick(&st2, 0);
+            st_ok(b == 0, "无功耗数据时增量即刻归零");
+        }
+        /* 充电扣除链: 90W 输入含 30W 充电 -> 前馈输入应等效 60W, 阶跃检测用 60 基线 */
+        {
+            struct ff_state st3;
+            ff_init(&st3);
+            for (int i = 0; i < 30; i++) ff_tick(&st3, 60.0);
+            double b60 = ff_tick(&st3, 60.0);
+            st_ok(b60 == 0, "充电扣除后稳态不前馈");
+        }
+    }
 
     printf("%s", L("[自测] 守护 pidfile 往返\n", "[selftest] daemon pidfile roundtrip\n"));
     if (access(SMART_PIDFILE, F_OK) == 0 || access(HOLD_PIDFILE, F_OK) == 0)

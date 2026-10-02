@@ -29,6 +29,9 @@ static NSMenuItem *g_holdItem;
 static NSMenuItem *g_holdTargetRoot;  /* "恒温目标" 父项, 子菜单为四档预设 */
 static NSMenuItem *g_langRoot;        /* "语言" 父项, 子菜单 中文/English */
 static int g_fan_n = 1;
+static char g_lastTitle[64];          /* 上拍标题 (同文不重设, 防空重绘) */
+static char g_lastRow0[64];           /* 上拍状态区第 0 行 */
+static char g_lastFanRow[10][64];     /* 上拍每风扇行 */
 
 /* ---- 界面双语 ---- */
 static int g_lang_en; /* 0=中文 1=English */
@@ -178,7 +181,12 @@ static int hold_idx(void) {
     if (T > -999) snprintf(tb, sizeof tb, "%.0f", T);
     if (mx_ac >= 0) snprintf(fb, sizeof fb, "%.0f", mx_ac / 1000.0);
     snprintf(buf, sizeof buf, "%s|%s", tb, fb);
-    g_item.button.title = U(buf);
+    /* 同文不重设: setTitle 即使内容相同也会标脏整个半透明菜单栏背景, 全天 2 秒一拍
+       的空重绘完全可省 (参考 TomEageer/fanctl 的同款优化) */
+    if (strcmp(buf, g_lastTitle) != 0) {
+        strcpy(g_lastTitle, buf);
+        g_item.button.title = U(buf);
+    }
 
     /* 状态区第 0 行: 最热传感器/曲线或恒温目标 + 整机功率。
        PSTR = 系统输入功率 W (与 ioreg SystemPowerIn 同源), 无此键的机器不显示 */
@@ -209,8 +217,12 @@ static int hold_idx(void) {
         else if (pw - cw > 0)
             snprintf(buf + off, sizeof buf - (size_t)off, "  %.0fW", pw - cw);
     }
-    if ([g_infoItems count] > 0)
-        [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
+    if ([g_infoItems count] > 0) {
+        if (strcmp(buf, g_lastRow0) != 0) { /* 同文不重设 (同标题栏优化) */
+            strcpy(g_lastRow0, buf);
+            [(NSMenuItem *)g_infoItems[0] setTitle:U(buf)];
+        }
+    }
 
     /* 每风扇一行: 当前 (目标) 模式; 同时统计控制状态 */
     int n_manual = 0, n_at_max = 0;
@@ -228,7 +240,10 @@ static int hold_idx(void) {
         if (tg < 0) snprintf(buf, sizeof buf, L("风扇%d  %6.0f rpm  %s", "Fan %d  %6.0f rpm  %s"), f, ac, ms);
         else        snprintf(buf, sizeof buf, L("风扇%d  %6.0f rpm (目标 %.0f)  %s",
                                                 "Fan %d  %6.0f rpm (target %.0f)  %s"), f, ac, tg, ms);
-        [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
+        if (strcmp(buf, g_lastFanRow[f]) != 0) { /* 同文不重设 */
+            strcpy(g_lastFanRow[f], buf);
+            [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
+        }
     }
 
     /* 四种模式互斥打钩: 当前生效的状态 */
@@ -239,13 +254,11 @@ static int hold_idx(void) {
     g_autoItem.state = (!smart && !hold && n_manual == 0)
                        ? NSControlStateValueOn : NSControlStateValueOff;
 
-    /* 智能模式: 运行中显示当前阈值 (阈值可运行中热更新) */
-    if (smart) {
-        g_smartItem.title = [NSString stringWithFormat:
-            U(L("智能模式 (%.0f~%.0f°C)", "Smart (%.0f~%.0f°C)")), slo, shi];
-    } else {
-        g_smartItem.title = U(L("智能模式", "Smart"));
-    }
+    /* 智能模式: 运行中显示当前阈值 (阈值可运行中热更新)。同样文不重设 */
+    NSString *st = smart ? [NSString stringWithFormat:
+            U(L("智能模式 (%.0f~%.0f°C)", "Smart (%.0f~%.0f°C)")), slo, shi]
+        : U(L("智能模式", "Smart"));
+    if (![st isEqualToString:g_smartItem.title]) g_smartItem.title = st;
     g_threshRoot.enabled = YES;
     /* 阈值子菜单: 当前档打钩 */
     int idx = thresh_idx();
@@ -253,13 +266,11 @@ static int hold_idx(void) {
     for (NSInteger i = 0; i < [sub numberOfItems]; i++)
         [sub itemAtIndex:i].state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
 
-    /* 恒温模式: 运行中显示当前目标 (可运行中热更新) */
-    if (hold) {
-        g_holdItem.title = [NSString stringWithFormat:
-            U(L("恒温模式 (→%.0f°C)", "Thermostat (→%.0f°C)")), ht];
-    } else {
-        g_holdItem.title = U(L("恒温模式", "Thermostat"));
-    }
+    /* 恒温模式: 运行中显示当前目标 (可运行中热更新)。同样文不重设 */
+    NSString *hts = hold ? [NSString stringWithFormat:
+            U(L("恒温模式 (→%.0f°C)", "Thermostat (→%.0f°C)")), ht]
+        : U(L("恒温模式", "Thermostat"));
+    if (![hts isEqualToString:g_holdItem.title]) g_holdItem.title = hts;
     g_holdTargetRoot.enabled = YES;
     idx = hold_idx();
     sub = g_holdTargetRoot.submenu;
@@ -373,8 +384,11 @@ static int hold_idx(void) {
     return [menu autorelease]; /* 按命名约定返回 +0, 所有权在接收方 */
 }
 
-/* 换菜单: setter 先保留新菜单再释放旧菜单; buildMenu 返回 +0, 此处不再 release */
+/* 换菜单: setter 先保留新菜单再释放旧菜单; buildMenu 返回 +0, 此处不再 release。
+   重建后 setTitle 缓存全部失效, 清空让下一 tick 必写一次 */
 - (void)rebuildMenu {
+    g_lastTitle[0] = g_lastRow0[0] = 0;
+    for (int f = 0; f < 10; f++) g_lastFanRow[f][0] = 0;
     g_item.menu = [self buildMenu];
 }
 
@@ -404,7 +418,10 @@ static int hold_idx(void) {
     [self tick];
 }
 
-- (void)flash:(NSString *)s { g_item.button.title = s; /* ≤2s 后 tick 自动刷新 */ }
+- (void)flash:(NSString *)s {
+    g_lastTitle[0] = 0; /* flash 会绕过缓存改标题, 清缓存让下一 tick 能写回真实值 */
+    g_item.button.title = s; /* ≤2s 后 tick 自动刷新 */
+}
 
 /* NSMenu 点任何项都会收起下拉; 动作完成后短暂延迟重新打开,
    效果上"点了不消失", 可连续切换并看到钩子变化 */
