@@ -94,6 +94,12 @@ fansctl power --json --watch 5 | jq -c '.system_w'
 </p>
 
 - Status item: `hottest°C|max rpm (krpm)`, refreshed every 2 s
+- "CPU avg" row: arithmetic mean of the CPU P/E-core sensors. Read it next
+  to the hottest value to tell whether the heat comes from the CPU (with a
+  GPU/memory hotspot the CPU average stays clearly lower; same idea as
+  macmon's `cpu_temp_avg`, but display-only — control still uses the hottest
+  sensor). Auto-hidden on machines without core sensors. `status --json`
+  outputs the same as `cpu_temp_avg` (`null` when unavailable)
 - First row: hottest sensor / curve % or thermostat target + system power draw
   (SMC key `PSTR`, same source as ioreg SystemPowerIn; auto-hidden on machines
   without it). While charging, the battery component (Amperage×Voltage) is

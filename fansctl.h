@@ -13,7 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.8.3"
+#define FANSCTL_VERSION "1.8.4"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5
@@ -280,6 +280,26 @@ static inline double hottest_temp(const char **name_out) {
     }
     if (name_out) *name_out = mxk;
     return mx;
+}
+
+/* CPU 核心平均温度: Tp*(性能核)/Te*(能效核) 全部传感器的算术平均, 回答
+   "热是不是来自 CPU" —— 最热可能是 GPU/SoC/内存, 与 CPU 平均一对比即可判断
+   (macmon 的 cpu_temp_avg 同思路; 但这里只做参考显示, 控制输入仍是最热值)。
+   无核心传感器的机型返回 -999, 调用方隐藏该显示 */
+static inline double cpu_avg_temp(void) {
+    scan_temp_keys();
+    double sum = 0;
+    int n = 0;
+    for (int i = 0; i < g_tkey_n; i++) {
+        const char *k = g_tkeys[i];
+        if (k[0] != 'T' || (k[1] != 'p' && k[1] != 'e')) continue;
+        double v;
+        if (read_key_value(k, NULL, &v, NULL) == 0 && plausible_temp(v)) {
+            sum += v;
+            n++;
+        }
+    }
+    return n > 0 ? sum / n : -999;
 }
 
 /* ============ 智能模式运行状态 (pidfile, CLI 与菜单栏互通) ============ */

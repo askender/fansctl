@@ -32,6 +32,8 @@ static int g_fan_n = 1;
 static char g_lastTitle[64];          /* 上拍标题 (同文不重设, 防空重绘) */
 static char g_lastRow0[64];           /* 上拍状态区第 0 行 */
 static char g_lastFanRow[10][64];     /* 上拍每风扇行 */
+static int g_cpuRowIdx = -1;          /* 状态区 "CPU 平均" 行的下标; -1 = 本机无核心传感器, 不显示 */
+static char g_lastCpuRow[32];
 
 /* ---- 界面双语 ---- */
 static int g_lang_en; /* 0=中文 1=English */
@@ -224,9 +226,23 @@ static int hold_idx(void) {
         }
     }
 
+    /* "CPU 平均" 行: 与最热值对比判断热是否来自 CPU (GPU/内存热点时 CPU 均明显更低)。
+       本机没有 CPU 核心传感器 (Tp/Te 族) 的机型, buildMenu 时就不加这一行 */
+    if (g_cpuRowIdx >= 0) {
+        double ca = cpu_avg_temp();
+        char cbuf[32];
+        if (ca > -999) snprintf(cbuf, sizeof cbuf, L("CPU 均 %.1f°C", "CPU avg %.1f°C"), ca);
+        else           snprintf(cbuf, sizeof cbuf, "%s", L("CPU 均 --", "CPU avg --"));
+        if (strcmp(cbuf, g_lastCpuRow) != 0) {
+            strcpy(g_lastCpuRow, cbuf);
+            [(NSMenuItem *)g_infoItems[g_cpuRowIdx] setTitle:U(cbuf)];
+        }
+    }
+
     /* 每风扇一行: 当前 (目标) 模式; 同时统计控制状态 */
+    int fanBase = 1 + (g_cpuRowIdx >= 0 ? 1 : 0); /* 风扇行在状态区的起始下标 */
     int n_manual = 0, n_at_max = 0;
-    for (int f = 0; f < g_fan_n && (NSInteger)(f + 1) < [g_infoItems count]; f++) {
+    for (int f = 0; f < g_fan_n && (NSInteger)(fanBase + f) < [g_infoItems count]; f++) {
         double ac = -1, tg = -1, mx = -1;
         read_rpm_key(f, "Ac", &ac);
         read_rpm_key(f, "Tg", &tg);
@@ -242,7 +258,7 @@ static int hold_idx(void) {
                                                 "Fan %d  %6.0f rpm (target %.0f)  %s"), f, ac, tg, ms);
         if (strcmp(buf, g_lastFanRow[f]) != 0) { /* 同文不重设 */
             strcpy(g_lastFanRow[f], buf);
-            [(NSMenuItem *)g_infoItems[f + 1] setTitle:U(buf)];
+            [(NSMenuItem *)g_infoItems[fanBase + f] setTitle:U(buf)];
         }
     }
 
@@ -296,6 +312,16 @@ static int hold_idx(void) {
     [menu addItem:it];
     [g_infoItems addObject:it];
     [it release];
+    g_cpuRowIdx = -1;
+    if (cpu_avg_temp() > -999) { /* 本机有 CPU 核心传感器 (Tp/Te 族) 才显示 "CPU 平均" 行 */
+        it = [[NSMenuItem alloc] initWithTitle:U(L("CPU 均 --", "CPU avg --"))
+                                        action:nil keyEquivalent:@""];
+        [it setEnabled:NO];
+        [menu addItem:it];
+        g_cpuRowIdx = (int)[g_infoItems count];
+        [g_infoItems addObject:it];
+        [it release];
+    }
     for (int f = 0; f < g_fan_n; f++) {
         it = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:U(L("风扇%d", "Fan %d")), f]
                                         action:nil keyEquivalent:@""];
@@ -387,7 +413,7 @@ static int hold_idx(void) {
 /* 换菜单: setter 先保留新菜单再释放旧菜单; buildMenu 返回 +0, 此处不再 release。
    重建后 setTitle 缓存全部失效, 清空让下一 tick 必写一次 */
 - (void)rebuildMenu {
-    g_lastTitle[0] = g_lastRow0[0] = 0;
+    g_lastTitle[0] = g_lastRow0[0] = g_lastCpuRow[0] = 0;
     for (int f = 0; f < 10; f++) g_lastFanRow[f][0] = 0;
     g_item.menu = [self buildMenu];
 }

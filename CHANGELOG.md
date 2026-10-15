@@ -2,6 +2,15 @@
 
 格式: 每个版本一节, GitHub Actions 发布 workflow 按 `## vX.Y.Z` 切片生成 Release 正文。
 
+## v1.8.4
+
+- 下拉菜单新增 "CPU 平均" 行: CPU 性能核/能效核 (Tp/Te 族) 传感器的算术
+  平均。与最热值一对比即可判断热是否来自 CPU —— GPU/内存热点时 CPU 均
+  明显更低 (fanctl 用 macmon 的 `cpu_temp_avg` 做控制输入; 这里只做参考
+  显示, 控制输入仍是最热值)。无核心传感器的机型自动隐藏
+- `status --json` 新增 `cpu_temp_avg` 字段 (无核心传感器为 `null`),
+  `watch --json` 每拍同步携带
+
 ## v1.8.3
 
 - 语言检测修正: sudo/launchd 拉起时不再被终端的 LANG 串味。此前终端

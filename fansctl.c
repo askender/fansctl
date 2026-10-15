@@ -470,7 +470,10 @@ static void json_status(void) {
                mode == 1 ? "manual" : mode == 0 ? "auto" : "unknown");
         first = 0;
     }
-    printf("]}\n");
+    /* CPU 核心平均温度 (Tp/Te 族, 与菜单栏 "CPU 平均" 行同源); 无该族传感器为 null */
+    printf("],\"cpu_temp_avg\":");
+    jnum(cpu_avg_temp(), 1);
+    printf("}\n");
 }
 
 static void json_temps(void) {

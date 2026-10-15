@@ -81,6 +81,10 @@ zsh/bash 补全。
 </p>
 
 - 状态栏标题: `最热°C|最大转速(krpm)`, 2 秒刷新
+- 下拉 "CPU 平均" 行: CPU 性能核/能效核传感器的算术平均, 与最热值对比即可
+  判断热是否来自 CPU (GPU/内存热点时 CPU 均明显更低; macmon `cpu_temp_avg`
+  同思路, 但只做参考显示, 控制输入仍是最热值); 无核心传感器的机型自动隐藏。
+  `status --json` 同步输出 `cpu_temp_avg` 字段 (无则 `null`)
 - 下拉第一行: 最热传感器/曲线%或恒温目标 + 机器功率 (SMC 键 `PSTR`,
   与 ioreg SystemPowerIn 同源; 无此键的机器自动隐藏)。充电时扣除
   Amperage×Voltage 充电分量并分列显示, 如 `34W+10W充` = 机器 34W +
