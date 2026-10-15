@@ -19,7 +19,7 @@ language and can be switched at any time from the menu. The CLI follows
 your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
 override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
 `/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.7.1).
+are kept grep-stable. Version: `fansctl version` (currently 1.8.2).
 
 ## Build & install
 
@@ -67,7 +67,8 @@ sudo fansctl hold [°C]       thermostat mode, PI closed loop on the hottest sen
                              mutually exclusive with smart; notifies if it cannot hold the target)
 sudo fansctl hold stop       stop thermostat mode (incl. menu-bar instances)
 fansctl bar install|uninstall|status   manage menu-bar auto-start (no sudo)
-fansctl doctor        collect diagnostics — attach the output when filing issues
+fansctl doctor        collect diagnostics (incl. load history from the daemon logs)
+                      — attach the output when filing issues
 ```
 
 Read-only commands accept `--json` (unknown values are `null`; keys in English
@@ -123,8 +124,19 @@ Baseline = the system's target RPM at the moment of takeover; if the fan was
 already in manual mode (stale session), it falls back to the minimum RPM.
 State pidfile `/tmp/fansctl.smart.pid` = `pid low high`, shared between CLI
 and menu bar. SIGTERM exits gracefully (restores auto); log:
-`/tmp/fansctl.smart.log` (includes the pid that sent the stop signal, useful
-for debugging unexpected exits).
+`/tmp/fansctl.smart.log` (one line per tick, stamped with local time;
+includes the pid that sent the stop signal, useful for debugging unexpected
+exits). Feedforward ticks carry an extra `W ff+rpm` segment:
+
+```text
+[10-02 16:20:31] [55~95°C] TCMz 70.8°C 曲线47% | 风扇0   3596 rpm (+47%) 手动 风扇1   3878 rpm (+47%) 手动
+[10-02 16:20:33] [55~95°C] TCMz 77.8°C 曲线57% | 38W ff+69 | 风扇0   3999 rpm (+88%) 手动 风扇1   4287 rpm (+88%) 手动
+[10-02 16:20:35] [55~95°C] TCMz 78.1°C 曲线58% | 39W ff+281 | 风扇0   4476 rpm (+96%) 手动 风扇1   4793 rpm (+95%) 手动
+```
+
+(a real trigger: the fans moved on the power ramp before the temperature
+peaked at 78.1°C, then the feedforward decayed and the temperature settled
+back to 71°C.)
 
 **Power feedforward** (v1.8.0): system power draw ≈ heat output, and the
 power signal moves seconds before the temperature does. Smart mode reads the
@@ -170,6 +182,11 @@ target temperature and a PI controller holds the hottest sensor there.
 - Velocity-form PI: ΔRPM = 25×Δerror + 8×error − 150×temperature trend
   (per second), increment clamped to ±250 rpm — no integral windup, the
   trend term damps overshoot
+- **Power feedforward** (v1.8.2): same source as Smart mode — on a load ramp
+  the fans are pushed up first and the PI follows gently, less overshoot.
+  The boost is added to the output, not into the PI's accumulated state, so
+  its decay never leaves an integration residue. Logs use the same `ff+`
+  format, so one set of grep statistics works for both daemons
 - Dead band: holds RPM while |error| < 0.3°C and the temperature is steady
 - Hands back to the system 3°C below target (fans may stop), retakes within
   1.5°C (hysteresis)

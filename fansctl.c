@@ -535,6 +535,30 @@ static double ff_tick(struct ff_state *st, double w) {
     return st->boost;
 }
 
+/* 前馈输入: PSTR 整机功耗扣除充电分量 (那部分能量入电池不发热)。
+   返回 0 表示无数据 (电池供电/无 PSTR 键/读数异常), ff_tick 会平滑退场。
+   智能与恒温两个守护循环共用, 保证日志里 ff+ 语义一致 */
+static double read_net_w(void) {
+    double pw = -1;
+    read_key_value("PSTR", NULL, &pw, NULL);
+    if (pw <= 0 || pw >= 1000) return 0;
+    struct power_info p;
+    if (power_read(&p) == 0 && p.charging && p.charge_w > 0) {
+        pw -= p.charge_w;
+        if (pw <= 0) pw = 0;
+    }
+    return pw;
+}
+
+/* 守护日志行首时间戳 (本地时间 月-日 时:分:秒): 日志一攒就是几天,
+   事后分析"前馈何时触发/温度何时冲高"必须有时间轴 */
+static void log_ts(char *out, size_t n) {
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(out, n, "[%m-%d %H:%M:%S] ", &tmv);
+}
+
 /* SMC 写楔住时的退避时长: 5 秒起步每失败一次翻倍, 60 秒封顶 */
 static uint64_t wedge_delay_ns(int wfail) {
     int s = 5 << (wfail - 1);
@@ -618,17 +642,7 @@ static int smart_loop(double t_lo, double t_hi) {
             notified = 0;
         }
         /* 功耗前馈: PSTR 整机功耗 (秒级), 充电时扣掉充电分量 (那部分入电池不发热) */
-        double pw = -1;
-        read_key_value("PSTR", NULL, &pw, NULL);
-        double ff_w = 0; /* 前馈输入: 净功耗 (0=无数据) */
-        if (pw > 0 && pw < 1000) {
-            struct power_info p;
-            if (power_read(&p) == 0 && p.charging && p.charge_w > 0) {
-                pw -= p.charge_w;
-                if (pw <= 0) pw = 0;
-            }
-            ff_w = pw;
-        }
+        double ff_w = read_net_w();
         double boost = ff_tick(&ff, ff_w);
         for (int f = 0; f < n; f++) {
             double mn = 0, mx = 6000;
@@ -691,10 +705,12 @@ static int smart_loop(double t_lo, double t_hi) {
             }
         }
         if (rc != 0) break;
-        printf(L("[%.0f~%.0f°C] %s %.1f°C 曲线%.0f%% |", "[%.0f~%.0f°C] %s %.1f°C curve %.0f%% |"),
-               t_lo, t_hi, tkey ? tkey : "?", T, frac * 100);
-        if (pw > 0 && boost > 0)
-            printf(L(" %.0fW 前馈+%.0f |", " %.0fW ff+%.0f |"), pw, boost);        for (int f = 0; f < n; f++) {
+        char tsbuf[32];
+        log_ts(tsbuf, sizeof tsbuf);
+        printf(L("%s[%.0f~%.0f°C] %s %.1f°C 曲线%.0f%% |", "%s[%.0f~%.0f°C] %s %.1f°C curve %.0f%% |"),
+               tsbuf, t_lo, t_hi, tkey ? tkey : "?", T, frac * 100);
+        if (ff_w > 0 && boost > 0)
+            printf(L(" %.0fW 前馈+%.0f |", " %.0fW ff+%.0f |"), ff_w, boost);        for (int f = 0; f < n; f++) {
             double ac = -1;
             read_rpm_key(f, "Ac", &ac);
             if (manual[f] && want[f] > 0 && base[f] > 0)
@@ -1275,8 +1291,10 @@ static int hold_loop(double t_set) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGUSR1, on_reload_signal); /* __hold target <°C> 就地更新目标 */
-    printf(L("恒温模式: 目标最热传感器 %.1f°C, PI 闭环控制; Ctrl+C 退出并恢复自动\n",
-             "Thermostat: holding hottest sensor at %.1f°C, PI closed loop; Ctrl+C exits and restores auto\n"), t_set);
+    struct ff_state ff;
+    ff_init(&ff);
+    printf(L("恒温模式: 目标最热传感器 %.1f°C, PI 闭环+功耗前馈; Ctrl+C 退出并恢复自动\n",
+             "Thermostat: holding hottest sensor at %.1f°C, PI closed loop with power feedforward; Ctrl+C exits and restores auto\n"), t_set);
     mach_timebase_info(&g_timebase);
     uint64_t tick_ns = cont_ns();
     double e_prev = 0, t_prev = -999;
@@ -1312,6 +1330,11 @@ static int hold_loop(double t_set) {
         double Ts = t_prev > -999 ? t_prev + 0.3 * (T - t_prev) : T; /* EMA 平滑 */
         double e = Ts - t_set;
         double dT = t_prev > -999 ? Ts - t_prev : 0;
+        /* 功耗前馈: 负载上坡时先垫转速, PI 少受一次误差冲击, 超调更小。
+           前馈加在输出上而不进 rpm[f] 累积状态 —— PI 只管稳态, 前馈退场
+           时不会带出积分残差 (与智能模式同源, 日志同为 ff+ 可 grep) */
+        double ff_w = read_net_w();
+        double boost = ff_tick(&ff, ff_w);
         /* 压不住告警: 持续高于目标 3°C (PI 此时必然已顶到满速) 通知一次, 回落后解除 */
         if (Ts > t_set + 3.0 && !notified) {
             notified = 1;
@@ -1371,8 +1394,10 @@ static int hold_loop(double t_set) {
             rpm[f] += delta;
             if (rpm[f] < mn) rpm[f] = mn;
             if (rpm[f] > mx) rpm[f] = mx;
-            if (last[f] < 0 || fabs(rpm[f] - last[f]) > 10) {
-                if (write_tg(f, rpm[f]) != 0) {
+            double out = rpm[f] + boost; /* 前馈不进 PI 状态, 只抬输出 */
+            if (out > mx) out = mx;
+            if (last[f] < 0 || fabs(out - last[f]) > 10) {
+                if (write_tg(f, out) != 0) {
                     /* 写楔住: 进退避, 不退出 (同智能模式) */
                     wfail++;
                     if (wfail == 1)
@@ -1382,13 +1407,17 @@ static int hold_loop(double t_set) {
                     continue;
                 }
                 wfail = 0;
-                last[f] = rpm[f];
+                last[f] = out;
             }
         }
         if (rc != 0) break;
-        printf(L("[→%.1f°C] %s %.1f°C(平%.1f) 误差%+.1f 趋势%+.2f |",
-                 "[→%.1f°C] %s %.1f°C(avg %.1f) error %+.1f trend %+.2f |"),
-               t_set, tkey ? tkey : "?", T, Ts, e, dT);
+        char tsbuf[32];
+        log_ts(tsbuf, sizeof tsbuf);
+        printf(L("%s[→%.1f°C] %s %.1f°C(平%.1f) 误差%+.1f 趋势%+.2f |",
+                 "%s[→%.1f°C] %s %.1f°C(avg %.1f) error %+.1f trend %+.2f |"),
+               tsbuf, t_set, tkey ? tkey : "?", T, Ts, e, dT);
+        if (ff_w > 0 && boost > 0)
+            printf(L(" %.0fW 前馈+%.0f |", " %.0fW ff+%.0f |"), ff_w, boost);
         for (int f = 0; f < n; f++) {
             double ac = -1;
             read_rpm_key(f, "Ac", &ac);
@@ -1718,6 +1747,62 @@ static void sysctl_str(const char *name, char *out, size_t n) {
     sysctlbyname(name, out, &n, NULL, 0); /* 失败留空串 */
 }
 
+/* doctor: 摘取守护日志尾部 —— 最近的前馈触发与最新状态行, 对照
+   "风扇为什么突然转起来"是否对应一次功耗跳变。日志由 root 守护写但
+   world-readable, doctor 无需特权; 文件不存在说明该模式没跑过。
+   日志可能几十 MB, 只倒着读最后 128KB */
+static int doctor_log_tail(const char *path, const char *label) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    long take = sz < 128 * 1024 ? sz : 128 * 1024;
+    fseek(fp, sz - take, SEEK_SET);
+    char *buf = malloc((size_t)take + 1);
+    if (!buf) { fclose(fp); return 0; }
+    size_t got = fread(buf, 1, (size_t)take, fp);
+    buf[got] = 0;
+    fclose(fp);
+    char last_ff[2][192] = {{0}, {0}}, last_line[192] = {0};
+    int ff_cnt = 0, any = 0;
+    char *p = buf;
+    if (sz > (long)take) { /* 窗口切进行中间, 第一段不完整, 丢弃 */
+        char *nl = strchr(p, '\n');
+        if (!nl) { free(buf); return 0; }
+        p = nl + 1;
+    }
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len > 0) {
+            any = 1;
+            char *dst = last_line;
+            if (strstr(p, "ff+") && len >= 3) {
+                dst = last_ff[0];
+                memmove(last_ff[0], last_ff[1], sizeof last_ff[0]); /* 留最近两条 */
+                ff_cnt++;
+            }
+            size_t cplen = len < sizeof last_line - 1 ? len : sizeof last_line - 1;
+            memcpy(dst, p, cplen);
+            dst[cplen] = 0;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+    free(buf);
+    if (!any) return 0;
+    printf("  %s: ", label);
+    if (ff_cnt > 0) {
+        printf(L("尾部前馈触发 %d 次\n", "%d feedforward events in tail\n"), ff_cnt);
+        for (int i = 0; i < 2; i++)
+            if (last_ff[i][0]) printf("    %s\n", last_ff[i]);
+    } else {
+        printf("%s", L("尾部窗口无前馈触发\n", "no feedforward events in tail window\n"));
+    }
+    if (last_line[0]) printf(L("    最新: %s\n", "    latest: %s\n"), last_line);
+    return 1;
+}
+
+
 static int doctor_cmd(void) {
     printf("fansctl %s\n", FANSCTL_VERSION);
     char model[64] = "", chip[128] = "", osv[32] = "", osb[32] = "";
@@ -1825,6 +1910,16 @@ static int doctor_cmd(void) {
                  "Thermostat: running (pid %d, →%.1f°C)\n"), pid, t);
     else
         printf("%s", L("恒温模式: 未运行\n", "Thermostat: not running\n"));
+
+    { /* 负载历史: 最近的前馈触发与温度/转速状态, 报"风扇异常"类 issue 时有用 */
+        if (access("/tmp/fansctl.smart.log", R_OK) == 0 ||
+            access("/tmp/fansctl.hold.log", R_OK) == 0) {
+            printf("%s", L("负载历史 (守护日志尾部, 时间戳为本地时间):\n",
+                           "Load history (daemon log tails, timestamps are local time):\n"));
+            doctor_log_tail("/tmp/fansctl.smart.log", L("智能", "smart"));
+            doctor_log_tail("/tmp/fansctl.hold.log", L("恒温", "hold"));
+        }
+    }
 
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
                                                    IOServiceMatching("AppleSmartBattery"));
