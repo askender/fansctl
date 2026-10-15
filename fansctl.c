@@ -22,16 +22,59 @@
 #include "fansctl.h"
 
 /* ==================== CLI 双语 (跟随系统语言) ====================
-   FANSCTL_LANG > LC_ALL > LC_MESSAGES > LANG, zh* 前缀 = 中文, 其余 = 英文;
-   全部未设置 = 中文 —— GUI 上下文 (LaunchAgent/菜单栏) 无 LANG, 由它拉起的
-   守护进程日志 (/tmp/fansctl.smart.log 等) 由此恒为中文, 便于 grep。
+   FANSCTL_LANG > 系统界面语言 > LC_ALL > LC_MESSAGES > LANG,
+   zh* 前缀 = 中文, 其余 = 英文; 全部未知 = 中文。
+   "系统界面语言"读控制台用户 GlobalPreferences 里的 AppleLanguages ——
+   sudo/launchd 拉起的环境里 locale 变量或被清空、或带着终端的值 (终端
+   LANG=en 而系统是中文很常见), 都不代表用户在系统设置里选的语言;
+   GUI 应用认的是 AppleLanguages, 守护进程的日志/通知与 GUI 同源。
    菜单栏界面另有独立可运行时切换的 L()/lang_init() (fansbar.m), 互不影响。 */
 static int g_lang_en;
 static const char *L(const char *zh, const char *en) { return g_lang_en ? en : zh; }
 
+static int system_lang_zh(void) {
+    int zh = -1; /* -1 = 读不到, 由调用方退回 locale 环境变量 */
+    struct stat cst;
+    if (stat("/dev/console", &cst) != 0 || cst.st_uid == 0) return -1;
+    struct passwd *pw = getpwuid(cst.st_uid); /* 登录用户的家目录 (root 也可读) */
+    if (!pw || !pw->pw_dir) return -1;
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/Library/Preferences/.GlobalPreferences.plist", pw->pw_dir);
+    CFStringRef pstr = CFStringCreateWithCString(kCFAllocatorDefault, path, kCFStringEncodingUTF8);
+    if (!pstr) return -1;
+    CFURLRef url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, pstr,
+                                                 kCFURLPOSIXPathStyle, false);
+    CFRelease(pstr);
+    if (!url) return -1;
+    CFReadStreamRef rs = CFReadStreamCreateWithFile(kCFAllocatorDefault, url);
+    if (rs && CFReadStreamOpen(rs)) {
+        CFPropertyListRef pl = CFPropertyListCreateWithStream(kCFAllocatorDefault, rs, 0,
+                                                              kCFPropertyListImmutable, NULL, NULL);
+        if (pl && CFGetTypeID(pl) == CFDictionaryGetTypeID()) {
+            CFTypeRef langs = CFDictionaryGetValue(pl, CFSTR("AppleLanguages"));
+            if (langs && CFGetTypeID(langs) == CFArrayGetTypeID() && CFArrayGetCount(langs) > 0) {
+                CFStringRef first = CFArrayGetValueAtIndex(langs, 0);
+                char buf[32] = "";
+                if (first && CFGetTypeID(first) == CFStringGetTypeID() &&
+                    CFStringGetCString(first, buf, sizeof buf, kCFStringEncodingUTF8))
+                    zh = (strncmp(buf, "zh", 2) == 0);
+            }
+        }
+        if (pl) CFRelease(pl);
+        CFReadStreamClose(rs);
+    }
+    if (rs) CFRelease(rs);
+    CFRelease(url);
+    return zh;
+}
+
 static void cli_lang_init(void) {
     const char *v = getenv("FANSCTL_LANG");
-    if (!v || !*v) v = getenv("LC_ALL");
+    if (v && *v) { g_lang_en = strncmp(v, "zh", 2) != 0; return; }
+    int syszh = system_lang_zh();
+    if (syszh >= 0) { g_lang_en = !syszh; return; }
+    /* 系统语言不可读 (罕见): 退回 locale 环境变量, 再退中文 */
+    v = getenv("LC_ALL");
     if (!v || !*v) v = getenv("LC_MESSAGES");
     if (!v || !*v) v = getenv("LANG");
     g_lang_en = (v && *v && strncmp(v, "zh", 2) != 0);

@@ -21,9 +21,9 @@ echo "[temps] 温度传感器"
 [ "$(./fansctl temps | grep -c '°C')" -ge 1 ] && ok "有温度读数" || bad "temps 无温度"
 ./fansctl temps | grep -qE '电池|CPU|GPU|SoC|内存|气流|闪存|热区|掌托|无线|环境' \
     && ok "传感器人类可读名出现" || bad "命名表未生效"
-t1=$(./fansctl temps --sort | head -1 | awk '{print $(NF-1)}')
-t2=$(./fansctl temps --sort | sed -n 2p | awk '{print $(NF-1)}')
-awk -v a="$t1" -v b="$t2" 'BEGIN{exit !(a>=b)}' && ok "temps --sort 降序" || bad "temps --sort 乱序"
+# 同一次采样内比较前两行: 两次独立调用之间温度会波动, 跨进程比较是竞态
+./fansctl temps --sort | head -2 | awk 'NR==1{a=$(NF-1)} NR==2{exit (a >= $(NF-1)) ? 0 : 1}' \
+    && ok "temps --sort 降序" || bad "temps --sort 乱序"
 ./fansctl temps --sort --above 500 | grep -q '未发现' && ok "--above 过滤生效" || bad "--above 过滤失效"
 ./fansctl temps --json | grep -q '"name"' && ok "temps --json 含 name 字段" || bad "temps --json 缺 name"
 

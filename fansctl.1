@@ -19,11 +19,13 @@ SMC through the 80-byte Apple Silicon ABI.
 Started with no arguments it becomes a menu bar app (it forks to the
 background and does not occupy the terminal).
 With a subcommand it acts as a CLI.
-The CLI follows the system language
-.Pq Ev FANSCTL_LANG , LC_ALL , LC_MESSAGES , LANG ;
-daemon logs
-.Pq smart/hold
-always stay in Chinese so they remain greppable.
+The CLI and the daemons' logs and notifications follow the system UI
+language (System Settings \(ra Language & Region, i.e. AppleLanguages of
+the console user);
+.Ev FANSCTL_LANG
+overrides everything, and the locale variables are only consulted when
+the system language cannot be read \(em so the terminal's LANG does not
+leak into sudo/launchd contexts.
 .Ss COMMANDS
 .Bl -tag -width "bar uninstall"
 .It Ic fans
@@ -169,7 +171,7 @@ restores auto mode at boot as a safety net.
 .It Ev FANSCTL_LANG
 Override the CLI language
 .Pq Cm zh / Cm en ;
-takes precedence over the locale variables.
+takes precedence over the system UI language and the locale variables.
 .It Ev FANSCTL_DEBUG
 Print SMC protocol details to stderr.
 .El

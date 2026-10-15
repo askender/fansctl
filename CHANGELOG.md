@@ -2,6 +2,16 @@
 
 格式: 每个版本一节, GitHub Actions 发布 workflow 按 `## vX.Y.Z` 切片生成 Release 正文。
 
+## v1.8.3
+
+- 语言检测修正: sudo/launchd 拉起时不再被终端的 LANG 串味。此前终端
+  LANG=en 时 `sudo fansctl smart` 的日志与系统通知全是英文, 菜单栏拉起的
+  守护却是中文 —— 现在统一优先读系统设置"语言与地区"的 AppleLanguages
+  (控制台用户 GlobalPreferences, 经 /dev/console uid 定位, root 守护可读),
+  `FANSCTL_LANG` 仍可强制, locale 环境变量退居其后
+- smoke 修复 `temps --sort 降序` 断言竞态: 原在两次独立调用间比较前两行,
+  机器满载温度秒级波动时误报乱序; 改为同一次输出内比较
+
 ## v1.8.2
 
 - 恒温模式接入功耗前馈 (v1.8.0 只在智能模式有): 负载上坡时先垫转速再让

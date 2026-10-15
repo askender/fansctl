@@ -6,13 +6,14 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <math.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#define FANSCTL_VERSION "1.8.2"
+#define FANSCTL_VERSION "1.8.3"
 
 #define KERNEL_INDEX_SMC     2
 #define SMC_CMD_READ_BYTES   5

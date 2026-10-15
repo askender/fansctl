@@ -15,11 +15,13 @@ third-party dependencies — links only system frameworks
 (IOKit / CoreFoundation / AppKit / Security).
 
 The menu-bar UI is bilingual (English / 中文): it follows your system
-language and can be switched at any time from the menu. The CLI follows
-your locale too (`FANSCTL_LANG` > `LC_ALL` > `LC_MESSAGES` > `LANG`;
-override with `FANSCTL_LANG=zh|en`). Daemon logs (`/tmp/fansctl.smart.log`,
-`/tmp/fansctl.hold.log`) stay Chinese — they are debugging artifacts and
-are kept grep-stable. Version: `fansctl version` (currently 1.8.2).
+language and can be switched at any time from the menu. The CLI and the
+daemons' logs/notifications follow the system UI language: priority is
+`FANSCTL_LANG` > System Settings Language & Region (AppleLanguages) >
+locale variables; override with `FANSCTL_LANG=zh|en`. The terminal's LANG
+no longer leaks into sudo/launchd contexts (before v1.8.3 a terminal with
+LANG=en made `sudo fansctl smart` log and notify in English).
+Version: `fansctl version` (currently 1.8.3).
 
 ## Build & install
 
